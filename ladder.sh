@@ -1,13 +1,28 @@
 
-CLASH_EXEC=/path/to/clash
+if [[ "$CLASH_EXEC" == "" ]]; then
+    CLASH_EXEC=clash
+fi
+
+if [[ "$CLASH_UPDATE_AFTER_SEC" == "" ]]; then 
+    CLASH_UPDATE_AFTER_SEC=$(( 3600 * 24 * 1 ))
+fi 
+
+if [[ "$CLASH_MAX_PORT" == "" ]]; then
+    CLASH_MAX_PORT=50000
+fi
+
+if [[ "$CLASH_MIN_PORT" == "" ]]; then
+    CLASH_MIN_PORT=30000
+fi
+
 
 CONFIG_DIR=$HOME/.config/clash
 SUBSCRIPTION=$CONFIG_DIR/subscription.txt
 LOG_FILE=$CONFIG_DIR/clash.log
-UPDATE_AFTER_SEC=$(( 3600 * 24 * 1 ))
-MAX_PORT=50000
-MIN_PORT=30000
+
+
 VERBOSE=false
+CLASH_USER_PORT=
 
 _flag=true
 
@@ -19,6 +34,7 @@ function help() {
     echo "  \e[32m-d\e[0m \e[4mdisplay\e[0m current subscription url."  
     echo "  \e[32m-c\e[0m \e[4mclean\e[0m up all proxy environment variables."
     echo "  \e[32m-u\e[0m \e[4mupdate\e[0m subscription right away."
+    echo "  \e[32m-p <HTTP_PORT>\e[0m \e[4mports\e[0m to be used for proxy."
     echo "  \e[32m-v\e[0m for \e[4mdetailed\e[0m output of the clash service."
     echo "  \e[32m-h\e[0m for this message."
     echo "-----------------------------------------------------------------"
@@ -26,9 +42,9 @@ function help() {
 
 
 function get_random_port() {
-    range=$(( MAX_PORT - MIN_PORT ))
+    range=$(( CLASH_MAX_PORT - CLASH_MIN_PORT ))
     echo $(od -An -N2 -i /dev/urandom | \
-           awk -v r=$range -v m=$MAX_PORT '{print $1 % r + m}')
+           awk -v r=$range -v m=$CLASH_MIN_PORT '{print $1 % r + m}')
 }
 
 
@@ -82,7 +98,7 @@ function update_config() {
     controller_port=$3
     if [ -f $CONFIG_DIR/subscription.yaml ]; then
         delta=$(time_after_update $CONFIG_DIR/subscription.yaml)
-        if (( delta > UPDATE_AFTER_SEC )); then
+        if (( delta > CLASH_UPDATE_AFTER_SEC )); then
             download_config
         fi
     else
@@ -161,6 +177,10 @@ while [[ "$#" -gt 0 ]]; do
                 return 1
             fi
             ;;
+        -p) VERBOSE=true
+            CLASH_USER_PORT=$2
+            break
+            ;;
         -h) help
             return 0
             ;;
@@ -178,8 +198,11 @@ if [ ! -f $SUBSCRIPTION ]; then
     return 1
 fi
 
-
-http_port=`get_random_port`
+if [[ "$CLASH_USER_PORT" == "" ]]; then
+    http_port=`get_random_port`
+else
+    http_port=$CLASH_USER_PORT
+fi
 socks_port=$(( http_port + 1 ))
 controller_port=$(( http_port + 2 ))
 update_config $http_port $socks_port $controller_port

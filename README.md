@@ -11,9 +11,16 @@ Command line tool for using clash service without sudo.
 
 **Note 2**: *The proxy opened by the `ladder` command will automatically exit when the session is closed (window closed, connection disconnected, exit command).*
 
-**Note 3**: *change the value of `CLASH_EXEC` at the beginning of `ladder.sh` before using.*
+**Note 3**: *Environment Variables:*
+    
+  - `CLASH_EXEC` where clash locates, by default `clash`
+  
+  - `CLASH_UPDATE_AFTER_SEC` interval time (measured in second) to update the subscription file, by default 1 day
 
- - Basic usage:
+  - `CLASH_MIN_PORT` and `CLASH_MAX_PORT` minimum and maximum ports available to clash, by default 30000 and 50000
+
+
+### Basic usage:
    ```bash
 
    # put this in .bashrc or .zshrc
@@ -27,6 +34,9 @@ Command line tool for using clash service without sudo.
    # (proceed automatically when session ended)
    ladder -k
    ```
+
+### Parameters
+
  - `ladder -h` **H**elp.
 
  - `ladder -s <subscription_url>` **S**et the subscription URL for Clash in the script. This only needs to be run once, unless you need to change the subscription URL.
@@ -36,6 +46,8 @@ Command line tool for using clash service without sudo.
  - `ladder -k` **K**ill current ladder process and clean up proxy related environment variables.
 
  - `ladder -u` **U**pdate subscription file right away (download from subscription url). 
+
+ - `ladder -p <PORT>` Specifies proxy **p**orts by `HTTP_PROXY=:$PORT`, `HTTPS_PROXY=:$PORT`, `ALL_PROXY=:$((PORT+1))`.
 
  - `ladder -v` Start the background proxy and set environment variables and display **v**erbose proxy-related output. It will display the information of nodes you connected to before each connection using the proxy is established. The output content will be appended to the current content (stdout) but will not affect shell operations.
 
