@@ -66,7 +66,7 @@ function download_config() {
     encoded_url=$(python3 -c "print('${raw_url}'.replace('\\\\', ''))")
     encoded_url=$(python3 -c "from urllib.parse import quote;print(quote('${encoded_url}', safe=''))")
     echo "\e[34mDownloading new subscription file ... \e[0m"
-    curl "https://subconverters.com/sub?target=clash&url=${encoded_url}" > $CONFIG_DIR/tmp.yaml
+    curl -k "https://subconverters.com/sub?target=clash&url=${encoded_url}" > $CONFIG_DIR/tmp.yaml
     lines=`wc --lines $CONFIG_DIR/tmp.yaml | awk '{print $1}'`
     if (( lines > 0 )); then 
         mv $CONFIG_DIR/tmp.yaml $CONFIG_DIR/subscription.yaml
