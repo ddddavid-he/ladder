@@ -177,7 +177,7 @@ while [[ "$#" -gt 0 ]]; do
                 return 1
             fi
             ;;
-        -p) VERBOSE=true
+        -p) #VERBOSE=true
             CLASH_USER_PORT=$2
             break
             ;;
