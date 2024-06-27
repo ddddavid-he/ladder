@@ -177,8 +177,12 @@ while [[ "$#" -gt 0 ]]; do
                 return 1
             fi
             ;;
-        -p) #VERBOSE=true
-            CLASH_USER_PORT=$2
+        -p) CLASH_USER_PORT=$2
+            if [[ "$CLASH_USER_PORT" == "" ]]; then
+                echo "\e[31mPlease provide port number after -p\e[0m"
+                help
+                return 1
+            fi
             break
             ;;
         -h) help
