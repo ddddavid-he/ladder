@@ -155,6 +155,9 @@ while [[ "$#" -gt 0 ]]; do
             unset HTTP_PROXY
             unset HTTPS_PROXY
             unset ALL_PROXY
+            unset http_proxy
+            unset https_proxy
+            unset all_proxy
             return 0
             ;;
         -v) VERBOSE=true
@@ -162,6 +165,9 @@ while [[ "$#" -gt 0 ]]; do
         -c) unset HTTP_PROXY
             unset HTTPS_PROXY
             unset ALL_PROXY
+            unset http_proxy
+            unset https_proxy
+            unset all_proxy
             echo "\e[34m*_PROXY variables unset.\e[0m"
             return 0
             ;;
@@ -220,6 +226,9 @@ start_service $http_port $socks_port
 export HTTP_PROXY=http://127.0.0.1:$http_port
 export HTTPS_PROXY=http://127.0.0.1:$http_port
 export ALL_PROXY=socks5://127.0.0.1:$socks_port
+export http_proxy=http://127.0.0.1:$http_port
+export http_proxy=http://127.0.0.1:$http_port
+export all_proxy=socks5://127.0.0.1:$socks_port
 
 
 sleep 2
