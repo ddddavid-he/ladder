@@ -322,8 +322,11 @@ ladder                        # 若代理已运行则开 TUI，否则先启动�
 ladder start                  # 仅启动代理（不开 TUI），使用配置文件中第一个订阅
 ladder start -s <NAME>        # 仅启动代理，指定订阅（按名称）
 ladder start -s <NAME> --env  # 启动代理，并输出 shell export 语句以应用代理
+ladder stop                   # 手动停止代理（不清除环境变量）
+ladder stop --env             # 停止代理，并输出 shell unset 语句以清除代理环境变量
+ladder env                    # 输出当前 export 语句（代理已运行时）
+ladder unenv                  # 输出 unset 语句，仅清除环境变量，不停止代理
 ladder tui                    # 仅开 TUI（连接已运行的代理）
-ladder stop                   # 手动停止代理
 ladder sub add <URL>          # 添加订阅
 ladder sub list               # 列出所有订阅
 ladder sub remove <NAME>      # 删除订阅
@@ -362,7 +365,41 @@ export no_proxy="localhost,127.0.0.1,::1"
 
 > `$$` 在 eval 展开时是当前 Shell 的 PID，watchdog 因此锚定到正确的 Shell。
 
-**指定订阅 `-s` 说明：**
+### 清除代理环境变量（unenv）
+
+与 `--env` 对称，提供两种清除方式：
+
+**方式一：停止代理同时清除环境变量**
+```sh
+eval "$(ladder stop --env)"
+```
+
+**方式二：仅清除环境变量，不停止代理（保留代理进程）**
+```sh
+eval "$(ladder unenv)"
+```
+
+`ladder unenv` / `ladder stop --env` 输出内容：
+```sh
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
+unset http_proxy https_proxy all_proxy
+unset NO_PROXY no_proxy
+# ladder: proxy env cleared
+```
+
+**推荐使用方式（与 1.0 体验对齐）：**
+```sh
+# 开启
+eval "$(ladder start -s 机场A --env)"
+
+# 关闭（停代理 + 清变量）
+eval "$(ladder stop --env)"
+
+# 仅清除变量（代理保持后台运行，其他终端仍可使用）
+eval "$(ladder unenv)"
+```
+
+> **设计说明**：`ladder stop` 只停止代理进程，**不**自动清除环境变量（因为无法操作父 Shell 的变量），清除必须通过 `eval` + unset 输出来完成，这与 1.0 的 `unset_proxy` 思路一致。
 
 | 命令 | 行为 |
 |------|------|
