@@ -8,7 +8,7 @@ mod tui;
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, SubCommands};
 use config::{LadderConfig, Subscription};
@@ -226,25 +226,49 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Install { shell }) => {
+            // ── Step 1: Install ladder-core binary ──────────────────────────
+            let current_exe = std::env::current_exe()?;
+            let bin_dir = install_bin_dir();
+            std::fs::create_dir_all(&bin_dir)?;
+            let dest_bin = bin_dir.join("ladder-core");
+            std::fs::copy(&current_exe, &dest_bin)
+                .with_context(|| format!("Failed to copy ladder-core to {}", dest_bin.display()))?;
+            // Set executable bit
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&dest_bin)?.permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&dest_bin, perms)?;
+            }
+            println!("✓ Installed ladder-core  →  {}", dest_bin.display());
+
+            // ── Step 2: Install ladder.sh ────────────────────────────────────
             let config = config::config_dir()?;
-            let ladder_sh_src = std::env::current_exe()?
+            let dest_sh = config.join("ladder.sh");
+
+            // Try same directory as current exe first, then fall back to embedded
+            let ladder_sh_src = current_exe
                 .parent()
                 .map(|p| p.join("ladder.sh"))
                 .filter(|p| p.exists());
 
-            // Write ladder.sh to config dir
-            let dest_sh = config.join("ladder.sh");
             if let Some(src) = ladder_sh_src {
                 std::fs::copy(&src, &dest_sh)?;
-                println!("✓ Copied ladder.sh to {}", dest_sh.display());
             } else {
-                // Embed ladder.sh content directly (fallback)
                 let sh_content = include_str!("../ladder.sh");
                 std::fs::write(&dest_sh, sh_content)?;
-                println!("✓ Written ladder.sh to {}", dest_sh.display());
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&dest_sh)?.permissions();
+                perms.set_mode(0o644);
+                std::fs::set_permissions(&dest_sh, perms)?;
+            }
+            println!("✓ Installed ladder.sh    →  {}", dest_sh.display());
 
-            // Detect shell
+            // ── Step 3: Print shell rc config (do NOT auto-inject) ───────────
             let shell_name = shell.unwrap_or_else(|| {
                 std::env::var("SHELL").unwrap_or_default()
                     .split('/')
@@ -254,48 +278,41 @@ async fn main() -> Result<()> {
             });
 
             let rc_file = match shell_name.as_str() {
-                "zsh" => dirs_rc("zsh"),
-                "bash" => dirs_rc("bash"),
-                other => {
-                    println!("Unknown shell: {}. Please manually add to your rc:", other);
-                    println!("  source {}", dest_sh.display());
+                "zsh"  => "~/.zshrc",
+                "bash" => "~/.bashrc",
+                "fish" => "~/.config/fish/config.fish",
+                other  => {
+                    println!("\nUnknown shell '{}'. Add the following line to your shell rc manually:", other);
+                    println!("\n  source {}\n", dest_sh.display());
                     return Ok(());
                 }
             };
 
-            let source_line = format!("\nsource {}\n", dest_sh.display());
-            let existing = std::fs::read_to_string(&rc_file).unwrap_or_default();
-            if !existing.contains(&dest_sh.display().to_string()) {
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&rc_file)?
-                    .write_all(source_line.as_bytes())?;
-                println!("✓ Added source line to {}", rc_file.display());
+            println!();
+            println!("━━━ Shell RC Configuration ━━━");
+            println!();
+            println!("Add the following line to {}:", rc_file);
+            println!();
+            if shell_name == "fish" {
+                println!("  # fish requires bass: https://github.com/edc/bass");
+                println!("  bass source {}", dest_sh.display());
             } else {
-                println!("✓ Already installed in {}", rc_file.display());
+                println!("  source {}", dest_sh.display());
             }
-            println!("Run: source {} (or open a new terminal)", rc_file.display());
+            println!();
+            println!("Then reload your shell:");
+            println!();
+            println!("  source {}", rc_file);
+            println!();
+            println!("Or open a new terminal window.");
         }
     }
 
     Ok(())
 }
 
-/// Return the rc file path for the given shell
-fn dirs_rc(shell: &str) -> std::path::PathBuf {
+/// Determine the directory to install ladder-core binary (~/.local/bin).
+fn install_bin_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    match shell {
-        "zsh" => std::path::PathBuf::from(format!("{}/.zshrc", home)),
-        "bash" => {
-            // Prefer .bash_profile on macOS, .bashrc on Linux
-            let bash_profile = std::path::PathBuf::from(format!("{}/.bash_profile", home));
-            if bash_profile.exists() && cfg!(target_os = "macos") {
-                bash_profile
-            } else {
-                std::path::PathBuf::from(format!("{}/.bashrc", home))
-            }
-        }
-        _ => std::path::PathBuf::from(format!("{}/.bashrc", home)),
-    }
+    std::path::PathBuf::from(format!("{}/.local/bin", home))
 }
