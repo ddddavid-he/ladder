@@ -85,14 +85,39 @@ fn get_latest_version() -> anyhow::Result<String> {
         tag_name: String,
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let mut req = reqwest::blocking::Client::builder()
         .user_agent("ladder-core-build/0.1")
-        .build()?;
-    let rel: Release = client
-        .get("https://api.github.com/repos/MetaCubeX/mihomo/releases/latest")
+        .build()?
+        .get("https://api.github.com/repos/MetaCubeX/mihomo/releases/latest");
+
+    // Use GITHUB_TOKEN if available (avoids anonymous rate limit in CI)
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let resp = req
         .send()
-        .map_err(|e| anyhow::anyhow!("GitHub API error: {}", e))?
-        .json()
-        .map_err(|e| anyhow::anyhow!("JSON parse error: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("GitHub API request failed: {}", e))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .map_err(|e| anyhow::anyhow!("Failed to read GitHub API response body: {}", e))?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "GitHub API returned HTTP {}: {}",
+            status,
+            body.chars().take(300).collect::<String>()
+        );
+    }
+
+    let rel: Release = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "JSON parse error: {} — body: {}",
+            e,
+            body.chars().take(300).collect::<String>()
+        )
+    })?;
     Ok(rel.tag_name)
 }

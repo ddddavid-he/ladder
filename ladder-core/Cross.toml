@@ -1,0 +1,5 @@
+# Cross.toml - Configuration for cross-compilation via `cross`
+# Passes GITHUB_TOKEN into the cross Docker container so build.rs
+# can authenticate GitHub API requests (avoids anonymous rate limit).
+[build.env]
+passthrough = ["GITHUB_TOKEN"]
