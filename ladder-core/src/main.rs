@@ -1,6 +1,12 @@
 mod cli;
 mod config;
 mod env;
+mod mihomo;
+mod watchdog;
+mod api;
+mod tui;
+
+use std::io::Write;
 
 use anyhow::Result;
 use clap::Parser;
@@ -25,9 +31,7 @@ async fn main() -> Result<()> {
         None => {
             let state = env::RuntimeState::load()?;
             if state.running {
-                println!("Proxy is running. Starting TUI...");
-                // TODO P5: 调用 tui::run()
-                println!("[TUI not yet implemented]");
+                tui::run().await?;
             } else {
                 println!("Ladder v2 - Proxy is not running.");
                 println!("Run `ladder start` to start the proxy.");
@@ -50,25 +54,73 @@ async fn main() -> Result<()> {
                 tracing::info!("  - {} ({})", s.name, s.url);
             }
 
+            // Get mihomo binary
+            let bin_path = mihomo::get_mihomo_path(mihomo_bin.as_deref()).await?;
+
+            // Generate mihomo config.yaml
+            let config_path = mihomo::write_config_yaml(&cfg, &subs)?;
+
+            // Spawn mihomo
+            let proc = mihomo::spawn_mihomo(&bin_path, &config_path).await?;
+            let mihomo_pid = proc.pid;
+
+            // Save runtime state
+            let mut state = crate::env::RuntimeState {
+                pid: Some(std::process::id()),
+                mihomo_pid: Some(mihomo_pid),
+                shell_pid,
+                http_port: cfg.ladder.port,
+                socks_port: cfg.ladder.socks_port,
+                control_port: cfg.ladder.control_port,
+                current_node: None,
+                running: true,
+            };
+            state.save()?;
+
+            // Output env vars if requested
             if env {
                 let vars = crate::env::EnvVars::new(cfg.ladder.port, cfg.ladder.socks_port);
                 println!("{}", vars.export_statements(shell_pid));
             }
 
-            // TODO P2: 启动 mihomo 进程
-            // TODO P3: 启动 watchdog
-            // TODO P4: 若 auto_best，执行自动选优
-            println!("[Proxy start not yet implemented - P2]");
+            tracing::info!("Proxy started. Mihomo PID: {}", mihomo_pid);
+
+            // P3: Start watchdog if shell_pid is set
+            if let Some(spid) = shell_pid {
+                tracing::info!("Watchdog started for shell PID {}", spid);
+                let wdcfg = watchdog::WatchdogConfig::new(spid, mihomo_pid);
+                let _watchdog = watchdog::spawn_watchdog(wdcfg);
+                // Keep ladder-core alive; exit when Ctrl+C or watchdog finishes
+                tokio::signal::ctrl_c().await.ok();
+            }
+
+            // P4: if auto_best, wait for API and run auto-best
+            if auto_best {
+                let mihomo_api = api::MihomoApi::new(cfg.ladder.control_port, cfg.ladder.api_secret.as_deref())?;
+                if let Err(e) = mihomo_api.wait_ready(10).await {
+                    tracing::warn!("API not ready for auto-best: {}", e);
+                } else {
+                    match mihomo_api.auto_best("PROXY", "https://www.gstatic.com/generate_204").await {
+                        Ok((node, delay)) => tracing::info!("Auto-best: {} ({}ms)", node, delay),
+                        Err(e) => tracing::warn!("Auto-best failed: {}", e),
+                    }
+                }
+            }
+            drop(proc);
         }
 
         Some(Commands::Stop { env }) => {
-            // TODO P2: 停止 mihomo 进程
+            let state = crate::env::RuntimeState::load()?;
+            if state.running {
+                if let Some(pid) = state.mihomo_pid {
+                    mihomo::stop_mihomo(pid).await?;
+                }
+            }
             if env {
                 println!("{}", crate::env::EnvVars::unset_statements());
             }
             crate::env::RuntimeState::clear()?;
             tracing::info!("Proxy stopped.");
-            println!("[Proxy stop not yet implemented - P2]");
         }
 
         Some(Commands::Env) => {
@@ -86,8 +138,7 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Tui) => {
-            // TODO P5: tui::run()
-            println!("[TUI not yet implemented - P5]");
+            tui::run().await?;
         }
 
         Some(Commands::Status) => {
@@ -155,15 +206,96 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Update { subscriptions }) => {
-            // TODO P4: 调用 Mihomo API 强制更新 provider
-            println!("[Update not yet implemented - P4], subs: {:?}", subscriptions);
+            let cfg = LadderConfig::load()?;
+            let state = crate::env::RuntimeState::load()?;
+            if !state.running {
+                anyhow::bail!("Proxy is not running. Start it first with `ladder start`.");
+            }
+            let mihomo_api = api::MihomoApi::new(cfg.ladder.control_port, cfg.ladder.api_secret.as_deref())?;
+            let subs = cfg.filter_subscriptions(&subscriptions);
+            if subs.is_empty() {
+                anyhow::bail!("No matching subscriptions to update.");
+            }
+            for s in &subs {
+                print!("Updating subscription: {}... ", s.name);
+                match mihomo_api.update_provider(&s.name).await {
+                    Ok(_) => println!("✓"),
+                    Err(e) => println!("✗ {}", e),
+                }
+            }
         }
 
         Some(Commands::Install { shell }) => {
-            // TODO P7: 安装 ladder.sh 到 ~/.config/ladder/，注入 shell rc
-            println!("[Install not yet implemented - P7], shell: {:?}", shell);
+            let config = config::config_dir()?;
+            let ladder_sh_src = std::env::current_exe()?
+                .parent()
+                .map(|p| p.join("ladder.sh"))
+                .filter(|p| p.exists());
+
+            // Write ladder.sh to config dir
+            let dest_sh = config.join("ladder.sh");
+            if let Some(src) = ladder_sh_src {
+                std::fs::copy(&src, &dest_sh)?;
+                println!("✓ Copied ladder.sh to {}", dest_sh.display());
+            } else {
+                // Embed ladder.sh content directly (fallback)
+                let sh_content = include_str!("../ladder.sh");
+                std::fs::write(&dest_sh, sh_content)?;
+                println!("✓ Written ladder.sh to {}", dest_sh.display());
+            }
+
+            // Detect shell
+            let shell_name = shell.unwrap_or_else(|| {
+                std::env::var("SHELL").unwrap_or_default()
+                    .split('/')
+                    .last()
+                    .unwrap_or("bash")
+                    .to_string()
+            });
+
+            let rc_file = match shell_name.as_str() {
+                "zsh" => dirs_rc("zsh"),
+                "bash" => dirs_rc("bash"),
+                other => {
+                    println!("Unknown shell: {}. Please manually add to your rc:", other);
+                    println!("  source {}", dest_sh.display());
+                    return Ok(());
+                }
+            };
+
+            let source_line = format!("\nsource {}\n", dest_sh.display());
+            let existing = std::fs::read_to_string(&rc_file).unwrap_or_default();
+            if !existing.contains(&dest_sh.display().to_string()) {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&rc_file)?
+                    .write_all(source_line.as_bytes())?;
+                println!("✓ Added source line to {}", rc_file.display());
+            } else {
+                println!("✓ Already installed in {}", rc_file.display());
+            }
+            println!("Run: source {} (or open a new terminal)", rc_file.display());
         }
     }
 
     Ok(())
+}
+
+/// Return the rc file path for the given shell
+fn dirs_rc(shell: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match shell {
+        "zsh" => std::path::PathBuf::from(format!("{}/.zshrc", home)),
+        "bash" => {
+            // Prefer .bash_profile on macOS, .bashrc on Linux
+            let bash_profile = std::path::PathBuf::from(format!("{}/.bash_profile", home));
+            if bash_profile.exists() && cfg!(target_os = "macos") {
+                bash_profile
+            } else {
+                std::path::PathBuf::from(format!("{}/.bashrc", home))
+            }
+        }
+        _ => std::path::PathBuf::from(format!("{}/.bashrc", home)),
+    }
 }
