@@ -4,7 +4,7 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
-use crate::config::{cache_dir, config_dir, LadderConfig, Subscription};
+use crate::config::{config_dir, data_dir, LadderConfig, Subscription};
 
 // ─── Bundled binary (compile-time embedded) ───────────────────────────────────
 
@@ -65,7 +65,7 @@ pub async fn get_mihomo_path(user_specified: Option<&Path>) -> Result<PathBuf> {
         bail!("Specified mihomo binary not found: {}", p.display());
     }
 
-    let cache = cache_dir()?;
+    let cache = data_dir()?;
     let cached_bin = cache.join("mihomo");
 
     // 2. Bundled

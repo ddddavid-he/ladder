@@ -22,6 +22,15 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// 获取数据目录：~/.local/ladder/（存放可执行文件，如 mihomo、ladder-core）
+pub fn data_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .context("HOME environment variable not set")?;
+    let path = PathBuf::from(home).join(".local").join("ladder");
+    fs::create_dir_all(&path).context("Failed to create data directory")?;
+    Ok(path)
+}
+
 /// 主配置文件：~/.config/ladder/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LadderConfig {

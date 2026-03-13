@@ -228,9 +228,8 @@ async fn main() -> Result<()> {
         Some(Commands::Install { shell }) => {
             // ── Step 1: Install ladder-core binary ──────────────────────────
             let current_exe = std::env::current_exe()?;
-            let bin_dir = install_bin_dir();
-            std::fs::create_dir_all(&bin_dir)?;
-            let dest_bin = bin_dir.join("ladder-core");
+            let data = config::data_dir()?;
+            let dest_bin = data.join("ladder-core");
             std::fs::copy(&current_exe, &dest_bin)
                 .with_context(|| format!("Failed to copy ladder-core to {}", dest_bin.display()))?;
             // Set executable bit
@@ -311,8 +310,7 @@ async fn main() -> Result<()> {
             println!("━━━ Mihomo (Core Engine) ━━━");
             println!();
 
-            let cache = config::cache_dir()?;
-            let cached_mihomo = cache.join("mihomo");
+            let cached_mihomo = data.join("mihomo");
 
             let has_mihomo = {
                 #[cfg(feature = "bundled")]
@@ -348,7 +346,6 @@ async fn main() -> Result<()> {
 
                 if input == "y" || input == "yes" {
                     println!();
-                    std::fs::create_dir_all(&cache)?;
                     println!("  Fetching latest mihomo version...");
                     match mihomo::latest_mihomo_version().await {
                         Ok(version) => {
@@ -370,10 +367,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Determine the directory to install ladder-core binary (~/.local/bin).
-fn install_bin_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(format!("{}/.local/bin", home))
 }
