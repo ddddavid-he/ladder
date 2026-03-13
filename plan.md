@@ -123,14 +123,14 @@ proxy-groups:
 ├──────────────────────────────────────────────────┤
 │ [机场A] [机场B] [全部]                   Tab切换 │
 ├──────────────────────────────────────────────────┤
-│ ▶ [当前] 🇭🇰 Hong Kong 01       23ms            │
+│ ▶ [当前] 🇭🇰 Hong Kong 01       23ms  ★ best   │
 │   🇯🇵 Japan Tokyo 02            45ms            │
 │   🇸🇬 Singapore 03              88ms            │
 │   ── 机场B ──────────────────────────           │
 │   🇺🇸 US Los Angeles 01        142ms            │
 │   🔴 Germany Frankfurt 01    timeout            │
 ├──────────────────────────────────────────────────┤
-│ [Enter]切换  [T]测速  [U]更新订阅  [Q]退出      │
+│ [Enter]切换  [T]测速  [A]自动最优  [U]更新  [Q]退出 │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -138,8 +138,30 @@ proxy-groups:
 - `Tab` 在不同订阅分组间切换
 - `Enter` 切换节点（PUT `/proxies/PROXY`）
 - `t` 触发全量测速（并发 GET delay API）
+- `a` **自动选择延迟最低节点**（Auto Best）
 - `u` 强制更新订阅 Provider
 - `q` 退出 TUI，**代理继续运行**
+
+### 自动选择最优节点（Auto Best）设计
+
+**触发方式：**
+- TUI 按 `a` 手动触发一次
+- `ladder start --auto-best` CLI flag：启动后自动执行一次测速并选择最优节点
+
+**执行流程：**
+```
+按 [A] / --auto-best
+  1. 并发调用 Mihomo GET /proxies/{name}/delay 对所有可用节点测速
+  2. 过滤掉 timeout（delay=0）节点
+  3. 取延迟最低的节点（若多个并列取第一个）
+  4. PUT /proxies/PROXY {"name": "最优节点名"} 切换
+  5. TUI 状态栏显示：✓ 已切换到最优节点 HK-01 (23ms)
+```
+
+**注意事项：**
+- 测速期间 TUI 节点列表显示 loading 动画，避免阻塞交互
+- timeout 节点在列表中标记为 🔴，不参与自动选择
+- 与 Mihomo 原生 `url-test` 组不同：这是**用户主动触发**的一次性选择，不会定时自动切换（避免意外中断连接）
 
 ---
 
@@ -296,16 +318,57 @@ push v* tag
 ## 十一、CLI 子命令
 
 ```
-ladder                   # 若代理已运行则开 TUI，否则先启动代理再开 TUI
-ladder start             # 仅启动代理（不开 TUI）
-ladder tui               # 仅开 TUI（连接已运行的代理）
-ladder stop              # 手动停止代理
-ladder sub add <URL>     # 添加订阅
-ladder sub list          # 列出所有订阅
-ladder sub remove <NAME> # 删除订阅
-ladder update            # 强制更新所有订阅
-ladder status            # 打印当前状态（运行中/已停止、当前节点、端口）
+ladder                        # 若代理已运行则开 TUI，否则先启动代理再开 TUI
+ladder start                  # 仅启动代理（不开 TUI），使用配置文件中第一个订阅
+ladder start -s <NAME>        # 仅启动代理，指定订阅（按名称）
+ladder start -s <NAME> --env  # 启动代理，并输出 shell export 语句以应用代理
+ladder tui                    # 仅开 TUI（连接已运行的代理）
+ladder stop                   # 手动停止代理
+ladder sub add <URL>          # 添加订阅
+ladder sub list               # 列出所有订阅
+ladder sub remove <NAME>      # 删除订阅
+ladder update                 # 强制更新所有订阅
+ladder status                 # 打印当前状态（运行中/已停止、当前节点、端口）
 ```
+
+### 纯 CLI 启动代理并应用代理环境变量
+
+无 TUI 场景（如脚本、CI 环境）下，用户希望一条命令完成：启动代理 + 当前 Shell 应用代理。
+
+**设计方案：`--env` flag + eval 模式**
+
+```sh
+# 方式一：eval 模式（推荐，一行搞定）
+eval "$(ladder start -s 机场A --env)"
+
+# 方式二：source 模式（等价）
+ladder start -s 机场A --env > /tmp/ladder-env.sh && source /tmp/ladder-env.sh
+```
+
+`ladder start --env` 输出内容（POSIX sh，eval 安全）：
+
+```sh
+export LADDER_SHELL_PID=$$
+export HTTP_PROXY="http://127.0.0.1:7890"
+export HTTPS_PROXY="http://127.0.0.1:7890"
+export ALL_PROXY="socks5://127.0.0.1:7891"
+export http_proxy="http://127.0.0.1:7890"
+export https_proxy="http://127.0.0.1:7890"
+export all_proxy="socks5://127.0.0.1:7891"
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="localhost,127.0.0.1,::1"
+# ladder: proxy started (PID 12345), sub=机场A, HTTP=7890 SOCKS5=7891
+```
+
+> `$$` 在 eval 展开时是当前 Shell 的 PID，watchdog 因此锚定到正确的 Shell。
+
+**指定订阅 `-s` 说明：**
+
+| 命令 | 行为 |
+|------|------|
+| `ladder start` | 使用配置中所有订阅（全量节点） |
+| `ladder start -s 机场A` | 仅加载"机场A"的订阅，生成精简 mihomo 配置 |
+| `ladder start -s 机场A -s 机场B` | 加载多个指定订阅 |
 
 ---
 
