@@ -5,19 +5,20 @@
 | 需求 | 方案 |
 |------|------|
 | 多订阅支持 | 配置文件支持多个 `proxy-provider`，TUI 可分组显示 |
-| zsh 兼容 | `ladder-env.sh` 用 POSIX sh 语法，兼容 bash/zsh/fish |
-| 发布两种 bin | `ladder-bundled`（内置 mihomo）+ `ladder`（外置 mihomo） |
+| zsh / bash 兼容 | `ladder.sh` 用 POSIX sh 语法，`source` 后提供 `ladder` shell 函数 |
+| 发布两种 bin | `ladder-core-bundled`（内置 mihomo）+ `ladder-core`（外置 mihomo） |
+| 环境变量透传 | Rust bin 改名为 `ladder-core`；`ladder.sh` 封装为 `ladder` 函数，自动 eval 处理透传 |
 
 ---
 
 ## 二、两种发布版本
 
-### `ladder`（外置版，推荐）
-- 体积小（~5MB）
+### `ladder-core`（外置版，推荐）
+- Rust 编译产物，体积小（~5MB）
 - 首次运行自动从 mihomo GitHub Release 下载对应平台版本到 `~/.config/ladder/mihomo`
-- 用户也可手动指定 mihomo 路径：`ladder --mihomo-bin /usr/local/bin/mihomo`
+- 用户也可手动指定 mihomo 路径：`ladder-core --mihomo-bin /usr/local/bin/mihomo`
 
-### `ladder-bundled`（内置版）
+### `ladder-core-bundled`（内置版）
 - 用 `include_bytes!` 宏在编译期将 mihomo 二进制嵌入
 - 体积较大（~20MB），但真正零依赖、离线可用
 - 构建时通过 build script（`build.rs`）自动下载对应平台 mihomo 并嵌入
@@ -41,7 +42,7 @@ fn get_mihomo_path() -> PathBuf {
 
 ```
 ladder/
-├── Cargo.toml
+├── Cargo.toml               # binary name: ladder-core
 ├── build.rs                 # bundled 版本：编译期下载 mihomo 嵌入
 ├── src/
 │   ├── main.rs              # CLI 入口，解析参数
@@ -53,12 +54,19 @@ ladder/
 │   │   ├── mod.rs           # TUI 入口
 │   │   ├── app.rs           # 应用状态机
 │   │   └── ui.rs            # 渲染逻辑（Ratatui）
-│   └── env.rs               # 生成 env export 输出
-├── ladder-env.sh            # POSIX sh，兼容 bash/zsh
+│   └── env.rs               # 生成 env export / unset 输出
+├── ladder.sh                # Shell 封装脚本：source 后提供 ladder 函数（透传环境变量）
 ├── .github/
 │   └── workflows/
 │       └── release.yml      # 自动构建 + Release
 └── README.md
+```
+
+**Cargo.toml 关键配置：**
+```toml
+[[bin]]
+name = "ladder-core"
+path = "src/main.rs"
 ```
 
 ---
@@ -140,7 +148,7 @@ proxy-groups:
 - `t` 触发全量测速（并发 GET delay API）
 - `a` **自动选择延迟最低节点**（Auto Best）
 - `u` 强制更新订阅 Provider
-- `q` 退出 TUI，**代理继续运行**
+- `q` 退出 TUI，**代理继续运行**，**不操作环境变量**
 
 ### 自动选择最优节点（Auto Best）设计
 
@@ -168,8 +176,9 @@ proxy-groups:
 ## 六、生命周期设计（核心）
 
 ```
-source ladder-env.sh (Shell PID=1234, export LADDER_SHELL_PID=$$)
-  └── ladder 进程（前台或后台均可）
+source ladder.sh  →  ladder start -s 机场A
+  (Shell PID=1234, export LADDER_SHELL_PID=$$)
+  └── ladder-core 进程（后台运行）
         ├── 启动 mihomo 子进程
         └── watchdog tokio task
               └── 每 2s 检查 Shell PID 1234 是否存活
@@ -178,7 +187,7 @@ source ladder-env.sh (Shell PID=1234, export LADDER_SHELL_PID=$$)
 
 | 操作 | 代理状态 |
 |------|---------|
-| `ladder` 启动 | ✅ 运行 |
+| `ladder start` 启动 | ✅ 运行 |
 | TUI 按 `q` 退出 | ✅ **继续运行** |
 | 启动时的 Shell 正常 `exit` | ❌ watchdog 检测，停止代理 |
 | Shell 被 `kill -9` | ❌ watchdog 检测，停止代理 |
@@ -221,27 +230,110 @@ fn is_pid_alive(pid: u32) -> bool {
 
 ---
 
-## 八、`ladder-env.sh`（POSIX 兼容）
+## 八、`ladder.sh`（Shell 封装脚本）
+
+### 设计原则
+
+- Rust bin 名为 `ladder-core`，**不直接暴露给用户**
+- `ladder.sh` 提供 `ladder` shell 函数，用户 `source ladder.sh` 后直接使用 `ladder` 命令
+- 凡是涉及环境变量的操作（`start --env`、`stop --env`、`unenv`）由 shell 函数自动 `eval`，实现透传
+- 其余子命令（`tui`、`status`、`sub`、`update` 等）直接透传给 `ladder-core`
+
+### 安装方式
+
+```sh
+# 手动：下载后 source
+source /path/to/ladder.sh
+
+# 推荐：写入 ~/.zshrc / ~/.bashrc（ladder install 自动完成）
+echo 'source ~/.config/ladder/ladder.sh' >> ~/.zshrc
+```
+
+### `ladder.sh` 完整内容
 
 ```sh
 #!/bin/sh
-# POSIX sh: compatible with bash, zsh, dash
-# fish 用户请使用 bass: bass source ladder-env.sh
-export LADDER_SHELL_PID=$$
-_port=$(cat "${LADDER_HOME:-$HOME/.config/ladder}/port" 2>/dev/null || echo 7890)
-_sport=$(cat "${LADDER_HOME:-$HOME/.config/ladder}/socks-port" 2>/dev/null || echo 7891)
+# ladder.sh - Shell wrapper for ladder-core
+# Usage: source ladder.sh
+# Supports: bash, zsh, dash (POSIX sh)
+# fish users: use `bass source ladder.sh`
 
-export HTTP_PROXY="http://127.0.0.1:$_port"
-export HTTPS_PROXY="http://127.0.0.1:$_port"
-export ALL_PROXY="socks5://127.0.0.1:$_sport"
-export http_proxy="$HTTP_PROXY"
-export https_proxy="$HTTPS_PROXY"
-export all_proxy="$ALL_PROXY"
-export NO_PROXY="localhost,127.0.0.1,::1"
-export no_proxy="$NO_PROXY"
+# 找到 ladder-core 的位置（同目录 > PATH）
+_ladder_core_bin() {
+    _dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    if [ -x "$_dir/ladder-core" ]; then
+        echo "$_dir/ladder-core"
+    elif command -v ladder-core >/dev/null 2>&1; then
+        echo "ladder-core"
+    else
+        echo "Error: ladder-core not found. Please install it first." >&2
+        return 1
+    fi
+}
 
-echo "✓ proxy → HTTP:$_port  SOCKS5:$_sport  (shell PID: $$)"
+ladder() {
+    _core=$(_ladder_core_bin) || return 1
+
+    case "$1" in
+        start)
+            # 含 --env flag：启动代理并透传环境变量到当前 Shell
+            if echo "$@" | grep -q -- '--env'; then
+                export LADDER_SHELL_PID=$$
+                eval "$("$_core" "$@" --shell-pid $$)"
+            else
+                "$_core" "$@"
+            fi
+            ;;
+        stop)
+            # 含 --env flag：停止代理并清除当前 Shell 环境变量
+            if echo "$@" | grep -q -- '--env'; then
+                eval "$("$_core" "$@")"
+            else
+                "$_core" "$@"
+            fi
+            ;;
+        unenv)
+            # 仅清除环境变量，不停代理
+            eval "$("$_core" unenv)"
+            ;;
+        env)
+            # 输出当前 export 语句（用户主动调用时也可直接 eval）
+            eval "$("$_core" env)"
+            ;;
+        *)
+            # tui / status / sub / update 等：直接透传
+            "$_core" "$@"
+            ;;
+    esac
+}
+
+# 使 ladder 函数在子 shell 中可用（bash only）
+[ -n "$BASH_VERSION" ] && export -f ladder 2>/dev/null || true
 ```
+
+### 用户使用体验
+
+```sh
+# 启动代理，当前 Shell 立即生效
+ladder start -s 机场A
+
+# 启动代理并设置环境变量（内部自动 eval，无需手写）
+ladder start -s 机场A --env
+
+# 关闭代理 + 清除环境变量
+ladder stop --env
+
+# 仅清除当前 Shell 的环境变量（代理继续运行）
+ladder unenv
+
+# 开启 TUI（直接透传给 ladder-core）
+ladder tui
+
+# 查看状态
+ladder status
+```
+
+> **关键点**：用户无需手写 `eval`，`ladder.sh` 的 shell 函数自动处理所有需要透传的场景。
 
 ---
 
@@ -255,10 +347,10 @@ echo "✓ proxy → HTTP:$_port  SOCKS5:$_sport  (shell PID: $$)"
 
 | 目标 | Runner | 编译方式 | 产物 |
 |------|--------|---------|------|
-| `x86_64-unknown-linux-musl` | `ubuntu-latest` | cross 工具链 | `ladder-linux-amd64` |
-| `aarch64-unknown-linux-musl` | `ubuntu-latest` | cross 工具链 | `ladder-linux-arm64` |
-| `x86_64-apple-darwin` | `macos-latest` | 原生 cargo | `ladder-macos-amd64` |
-| `aarch64-apple-darwin` | `macos-latest` | 原生 cargo | `ladder-macos-arm64` |
+| `x86_64-unknown-linux-musl` | `ubuntu-latest` | cross 工具链 | `ladder-core-linux-amd64` |
+| `aarch64-unknown-linux-musl` | `ubuntu-latest` | cross 工具链 | `ladder-core-linux-arm64` |
+| `x86_64-apple-darwin` | `macos-latest` | 原生 cargo | `ladder-core-macos-amd64` |
+| `aarch64-apple-darwin` | `macos-latest` | 原生 cargo | `ladder-core-macos-arm64` |
 
 > Linux 用 musl 静态编译（零 glibc 依赖），macOS 用系统 SDK 原生编译。
 
@@ -266,15 +358,15 @@ echo "✓ proxy → HTTP:$_port  SOCKS5:$_sport  (shell PID: $$)"
 
 | 文件 | 说明 |
 |------|------|
-| `ladder-linux-amd64` | Linux x86_64，musl 静态 |
-| `ladder-linux-arm64` | Linux arm64，musl 静态 |
-| `ladder-macos-amd64` | macOS Intel |
-| `ladder-macos-arm64` | macOS Apple Silicon |
-| `ladder-bundled-linux-amd64` | 同上，内置 mihomo |
-| `ladder-bundled-linux-arm64` | 同上，内置 mihomo |
-| `ladder-bundled-macos-amd64` | 同上，内置 mihomo |
-| `ladder-bundled-macos-arm64` | 同上，内置 mihomo |
-| `ladder-env.sh` | 环境变量脚本（POSIX sh） |
+| `ladder-core-linux-amd64` | Linux x86_64，musl 静态，外置 mihomo |
+| `ladder-core-linux-arm64` | Linux arm64，musl 静态，外置 mihomo |
+| `ladder-core-macos-amd64` | macOS Intel，外置 mihomo |
+| `ladder-core-macos-arm64` | macOS Apple Silicon，外置 mihomo |
+| `ladder-core-bundled-linux-amd64` | 同上，内置 mihomo |
+| `ladder-core-bundled-linux-arm64` | 同上，内置 mihomo |
+| `ladder-core-bundled-macos-amd64` | 同上，内置 mihomo |
+| `ladder-core-bundled-macos-arm64` | 同上，内置 mihomo |
+| `ladder.sh` | Shell 封装脚本（POSIX sh，source 后提供 ladder 命令） |
 | `checksums.txt` | SHA256 校验 |
 
 ### workflow 逻辑概览
@@ -282,17 +374,17 @@ echo "✓ proxy → HTTP:$_port  SOCKS5:$_sport  (shell PID: $$)"
 ```
 push v* tag
   ├── job: build-external (4个平台)
-  │     cargo build --release
+  │     cargo build --release  (binary: ladder-core)
   │     Linux: cross + musl target
   │     macOS: native cargo
   │
   ├── job: build-bundled (4个平台)
   │     build.rs 下载对应平台 mihomo bin
-  │     cargo build --release --features bundled
+  │     cargo build --release --features bundled  (binary: ladder-core-bundled)
   │
   └── job: release
         needs: [build-external, build-bundled]
-        收集全部 8 个 artifacts
+        收集全部 8 个 artifacts + ladder.sh
         生成 checksums.txt
         创建 GitHub Release 并上传所有文件
 ```
@@ -315,43 +407,33 @@ push v* tag
 
 ---
 
-## 十一、CLI 子命令
+## 十一、CLI 子命令（`ladder-core` 原始接口）
+
+> 用户通过 `ladder.sh` 封装的 `ladder` 函数调用，底层实际执行 `ladder-core`。
 
 ```
-ladder                        # 若代理已运行则开 TUI，否则先启动代理再开 TUI
-ladder start                  # 仅启动代理（不开 TUI），使用配置文件中第一个订阅
-ladder start -s <NAME>        # 仅启动代理，指定订阅（按名称）
-ladder start -s <NAME> --env  # 启动代理，并输出 shell export 语句以应用代理
-ladder stop                   # 手动停止代理（不清除环境变量）
-ladder stop --env             # 停止代理，并输出 shell unset 语句以清除代理环境变量
-ladder env                    # 输出当前 export 语句（代理已运行时）
-ladder unenv                  # 输出 unset 语句，仅清除环境变量，不停止代理
-ladder tui                    # 仅开 TUI（连接已运行的代理）
-ladder sub add <URL>          # 添加订阅
-ladder sub list               # 列出所有订阅
-ladder sub remove <NAME>      # 删除订阅
-ladder update                 # 强制更新所有订阅
-ladder status                 # 打印当前状态（运行中/已停止、当前节点、端口）
+ladder-core                           # 若代理已运行则开 TUI，否则先启动代理再开 TUI
+ladder-core start                     # 仅启动代理（不开 TUI），使用所有订阅
+ladder-core start -s <NAME>           # 仅启动代理，指定订阅（按名称）
+ladder-core start -s <NAME> --env     # 启动代理，stdout 输出 shell export 语句
+ladder-core start --shell-pid <PID>   # 启动时绑定 Shell PID（由 ladder.sh 自动传入）
+ladder-core stop                      # 手动停止代理
+ladder-core stop --env                # 停止代理，stdout 输出 shell unset 语句
+ladder-core env                       # stdout 输出当前 export 语句（代理运行时）
+ladder-core unenv                     # stdout 输出 unset 语句
+ladder-core tui                       # 仅开 TUI（连接已运行的代理）
+ladder-core sub add <URL>             # 添加订阅
+ladder-core sub list                  # 列出所有订阅
+ladder-core sub remove <NAME>         # 删除订阅
+ladder-core update                    # 强制更新所有订阅
+ladder-core status                    # 打印当前状态（运行中/已停止、当前节点、端口）
+ladder-core install                   # 安装：将 ladder.sh 写入 ~/.config/ladder/，并注入 ~/.zshrc / ~/.bashrc
 ```
 
-### 纯 CLI 启动代理并应用代理环境变量
-
-无 TUI 场景（如脚本、CI 环境）下，用户希望一条命令完成：启动代理 + 当前 Shell 应用代理。
-
-**设计方案：`--env` flag + eval 模式**
+### `--env` 输出格式（ladder-core stdout）
 
 ```sh
-# 方式一：eval 模式（推荐，一行搞定）
-eval "$(ladder start -s 机场A --env)"
-
-# 方式二：source 模式（等价）
-ladder start -s 机场A --env > /tmp/ladder-env.sh && source /tmp/ladder-env.sh
-```
-
-`ladder start --env` 输出内容（POSIX sh，eval 安全）：
-
-```sh
-export LADDER_SHELL_PID=$$
+export LADDER_SHELL_PID=1234
 export HTTP_PROXY="http://127.0.0.1:7890"
 export HTTPS_PROXY="http://127.0.0.1:7890"
 export ALL_PROXY="socks5://127.0.0.1:7891"
@@ -360,46 +442,17 @@ export https_proxy="http://127.0.0.1:7890"
 export all_proxy="socks5://127.0.0.1:7891"
 export NO_PROXY="localhost,127.0.0.1,::1"
 export no_proxy="localhost,127.0.0.1,::1"
-# ladder: proxy started (PID 12345), sub=机场A, HTTP=7890 SOCKS5=7891
 ```
 
-> `$$` 在 eval 展开时是当前 Shell 的 PID，watchdog 因此锚定到正确的 Shell。
+### `unenv` 输出格式（ladder-core stdout）
 
-### 清除代理环境变量（unenv）
-
-与 `--env` 对称，提供两种清除方式：
-
-**方式一：停止代理同时清除环境变量**
-```sh
-eval "$(ladder stop --env)"
-```
-
-**方式二：仅清除环境变量，不停止代理（保留代理进程）**
-```sh
-eval "$(ladder unenv)"
-```
-
-`ladder unenv` / `ladder stop --env` 输出内容：
 ```sh
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY
 unset http_proxy https_proxy all_proxy
-unset NO_PROXY no_proxy
-# ladder: proxy env cleared
+unset NO_PROXY no_proxy LADDER_SHELL_PID
 ```
 
-**推荐使用方式（与 1.0 体验对齐）：**
-```sh
-# 开启
-eval "$(ladder start -s 机场A --env)"
-
-# 关闭（停代理 + 清变量）
-eval "$(ladder stop --env)"
-
-# 仅清除变量（代理保持后台运行，其他终端仍可使用）
-eval "$(ladder unenv)"
-```
-
-> **设计说明**：`ladder stop` 只停止代理进程，**不**自动清除环境变量（因为无法操作父 Shell 的变量），清除必须通过 `eval` + unset 输出来完成，这与 1.0 的 `unset_proxy` 思路一致。
+### `-s` 订阅过滤说明
 
 | 命令 | 行为 |
 |------|------|
@@ -417,6 +470,6 @@ eval "$(ladder unenv)"
 | **P2** | `mihomo.rs`：自动下载（外置）+ `build.rs`（内置） |
 | **P3** | `watchdog.rs`：Linux `/proc` + macOS `kill -0` 双实现 |
 | **P4** | `api.rs`：Mihomo RESTful 客户端（节点列表/切换/测速/更新订阅） |
-| **P5** | TUI：节点列表（多订阅分组 Tab）+ 切换 + 测速 |
-| **P6** | CLI 子命令（`start/stop/status/sub` 等） |
-| **P7** | `release.yml` GitHub Actions + `ladder-env.sh` + README |
+| **P5** | TUI：节点列表（多订阅分组 Tab）+ 切换 + 测速 + Auto Best |
+| **P6** | CLI 子命令（`start/stop/status/sub/install` 等）+ `env.rs` 输出 |
+| **P7** | `ladder.sh` 封装脚本 + `release.yml` GitHub Actions + README |
