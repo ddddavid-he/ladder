@@ -183,6 +183,29 @@ impl MihomoApi {
         }
     }
 
+    /// PUT /configs?force=true - Reload mihomo config from file
+    pub async fn reload_config(&self, config_path: &std::path::Path) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct Body {
+            path: String,
+        }
+        let resp = self
+            .client
+            .put(format!("{}/configs?force=true", self.base_url))
+            .json(&Body {
+                path: config_path.to_string_lossy().to_string(),
+            })
+            .send()
+            .await
+            .context("PUT /configs?force=true failed")?;
+        if resp.status().is_success() {
+            info!("Mihomo config reloaded from {}", config_path.display());
+            Ok(())
+        } else {
+            bail!("Reload config failed: HTTP {}", resp.status())
+        }
+    }
+
     // ─── Auto-Best selection ─────────────────────────────────────────────────
 
     /// Test all nodes in a group concurrently and select the lowest-latency one.

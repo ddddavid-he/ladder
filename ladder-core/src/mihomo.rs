@@ -180,6 +180,92 @@ fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ─── Subscription format detection ───────────────────────────────────────────
+
+/// Detected format of a subscription file
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubscriptionFormat {
+    /// Full Clash/Mihomo config (has `proxies` + `rules` or `proxy-groups`)
+    FullConfig,
+    /// Only a proxies list, suitable for proxy-provider
+    ProxyProvider,
+}
+
+/// Detect the format of a downloaded subscription YAML.
+/// Returns `FullConfig` if the document contains both a `proxies` key and at
+/// least one of `rules` / `proxy-groups` / `mode` (i.e. looks like a complete
+/// Clash config).  Otherwise returns `ProxyProvider`.
+pub fn detect_subscription_format(yaml_text: &str) -> SubscriptionFormat {
+    let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(yaml_text) else {
+        return SubscriptionFormat::ProxyProvider;
+    };
+    let map = match &val {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => return SubscriptionFormat::ProxyProvider,
+    };
+
+    let has_proxies = map.contains_key(&serde_yaml::Value::String("proxies".into()));
+    let has_config_keys = map.contains_key(&serde_yaml::Value::String("rules".into()))
+        || map.contains_key(&serde_yaml::Value::String("proxy-groups".into()))
+        || map.contains_key(&serde_yaml::Value::String("mode".into()));
+
+    if has_proxies && has_config_keys {
+        SubscriptionFormat::FullConfig
+    } else {
+        SubscriptionFormat::ProxyProvider
+    }
+}
+
+/// Download the content of a subscription URL and return raw text.
+pub async fn fetch_subscription(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("clash.meta")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch subscription: {}", url))?;
+    if !resp.status().is_success() {
+        bail!("Subscription fetch failed: HTTP {}", resp.status());
+    }
+    resp.text().await.context("Failed to read subscription body")
+}
+
+/// Merge a full Clash config with ladder's port/controller settings.
+/// Overwrites mixed-port, socks-port, external-controller and secret,
+/// then serialises back to YAML string.
+pub fn merge_full_config(yaml_text: &str, cfg: &LadderConfig) -> Result<String> {
+    let mut val: serde_yaml::Value =
+        serde_yaml::from_str(yaml_text).context("Failed to parse subscription YAML")?;
+
+    let map = val
+        .as_mapping_mut()
+        .context("Subscription YAML is not a mapping")?;
+
+    macro_rules! set {
+        ($key:expr, $v:expr) => {
+            map.insert(
+                serde_yaml::Value::String($key.into()),
+                $v,
+            );
+        };
+    }
+
+    set!("mixed-port", serde_yaml::Value::Number(cfg.ladder.port.into()));
+    set!("socks-port", serde_yaml::Value::Number(cfg.ladder.socks_port.into()));
+    set!(
+        "external-controller",
+        serde_yaml::Value::String(format!("127.0.0.1:{}", cfg.ladder.control_port))
+    );
+    if let Some(secret) = &cfg.ladder.api_secret {
+        set!("secret", serde_yaml::Value::String(secret.clone()));
+    }
+
+    serde_yaml::to_string(&val).context("Failed to serialize merged config YAML")
+}
+
 // ─── Config YAML generation ───────────────────────────────────────────────────
 
 /// Generate a Mihomo config.yaml from LadderConfig + filtered subscriptions
@@ -356,6 +442,59 @@ pub fn write_config_yaml(cfg: &LadderConfig, subs: &[&Subscription]) -> Result<P
     Ok(path)
 }
 
+/// Smart config writer: detects subscription format and chooses the best strategy.
+///
+/// - Single `FullConfig`: merges port/controller settings directly into it.
+/// - All `ProxyProvider`: uses the standard proxy-provider generation.
+/// - Mixed / multiple full configs: falls back to proxy-provider mode.
+///
+/// Returns `(path, strategy_description)`.
+pub async fn smart_write_config_yaml(
+    cfg: &LadderConfig,
+    subs: &[&Subscription],
+) -> Result<(PathBuf, String)> {
+    if subs.is_empty() {
+        bail!("No subscriptions provided");
+    }
+
+    // Fetch all subscription texts and detect formats
+    let mut fetched: Vec<(&Subscription, String, SubscriptionFormat)> = Vec::new();
+    for s in subs {
+        let text = fetch_subscription(&s.url).await
+            .with_context(|| format!("Failed to fetch subscription: {}", s.name))?;
+        let fmt = detect_subscription_format(&text);
+        info!("Subscription '{}' detected as: {:?}", s.name, fmt);
+        fetched.push((s, text, fmt));
+    }
+
+    let all_full = fetched.iter().all(|(_, _, f)| *f == SubscriptionFormat::FullConfig);
+    let all_provider = fetched.iter().all(|(_, _, f)| *f == SubscriptionFormat::ProxyProvider);
+
+    let path = config_dir()?.join("mihomo-config.yaml");
+
+    if all_full && fetched.len() == 1 {
+        // Single full config: merge port/controller directly
+        let (s, text, _) = &fetched[0];
+        let yaml = merge_full_config(text, cfg)
+            .with_context(|| format!("Failed to merge full config for '{}'", s.name))?;
+        std::fs::write(&path, &yaml)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        info!("Smart config: using full config from '{}'", s.name);
+        Ok((path, format!("full-config ({})", s.name)))
+    } else if all_provider {
+        // All are proxy-provider format: use standard generation
+        let config_path = write_config_yaml(cfg, subs)?;
+        Ok((config_path, "proxy-provider".to_string()))
+    } else {
+        // Mixed or multiple full configs: fall back to proxy-provider
+        warn!(
+            "Mixed subscription formats detected, falling back to proxy-provider mode."
+        );
+        let config_path = write_config_yaml(cfg, subs)?;
+        Ok((config_path, "proxy-provider (mixed fallback)".to_string()))
+    }
+}
+
 // ─── Process management ───────────────────────────────────────────────────────
 
 pub struct MihomoProcess {
@@ -473,4 +612,78 @@ mod tests {
         assert!(yaml.contains("GEOIP,CN,DIRECT"));
         assert!(yaml.contains("MATCH,PROXY"));
     }
+
+    // ─── Format detection tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_detect_full_config() {
+        let yaml = r#"
+port: 7890
+mode: rule
+proxies:
+  - name: node1
+    type: ss
+    server: example.com
+    port: 443
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [node1]
+rules:
+  - MATCH,PROXY
+"#;
+        assert_eq!(detect_subscription_format(yaml), SubscriptionFormat::FullConfig);
+    }
+
+    #[test]
+    fn test_detect_proxy_provider() {
+        let yaml = r#"
+proxies:
+  - name: node1
+    type: ss
+    server: example.com
+    port: 443
+  - name: node2
+    type: vmess
+    server: example.com
+    port: 8443
+"#;
+        assert_eq!(detect_subscription_format(yaml), SubscriptionFormat::ProxyProvider);
+    }
+
+    #[test]
+    fn test_detect_invalid_yaml() {
+        assert_eq!(detect_subscription_format("not: valid: yaml: ["), SubscriptionFormat::ProxyProvider);
+    }
+
+    #[test]
+    fn test_merge_full_config_overrides_ports() {
+        let yaml = r#"
+mixed-port: 1234
+socks-port: 5678
+external-controller: "127.0.0.1:9999"
+mode: rule
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
+"#;
+        let cfg = make_config();
+        let merged = merge_full_config(yaml, &cfg).unwrap();
+        let val: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+        let map = val.as_mapping().unwrap();
+        assert_eq!(
+            map[&serde_yaml::Value::String("mixed-port".into())],
+            serde_yaml::Value::Number(cfg.ladder.port.into())
+        );
+        assert_eq!(
+            map[&serde_yaml::Value::String("socks-port".into())],
+            serde_yaml::Value::Number(cfg.ladder.socks_port.into())
+        );
+        let ctrl = map[&serde_yaml::Value::String("external-controller".into())]
+            .as_str()
+            .unwrap();
+        assert!(ctrl.contains(&cfg.ladder.control_port.to_string()));
+    }
+
 }

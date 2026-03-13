@@ -57,8 +57,9 @@ async fn main() -> Result<()> {
             // Get mihomo binary
             let bin_path = mihomo::get_mihomo_path(mihomo_bin.as_deref()).await?;
 
-            // Generate mihomo config.yaml
-            let config_path = mihomo::write_config_yaml(&cfg, &subs)?;
+            // Generate mihomo config.yaml (smart: auto-detect full-config vs proxy-provider)
+            let (config_path, strategy) = mihomo::smart_write_config_yaml(&cfg, &subs).await?;
+            tracing::info!("Config strategy: {}", strategy);
 
             // Spawn mihomo
             let proc = mihomo::spawn_mihomo(&bin_path, &config_path).await?;
@@ -241,16 +242,58 @@ async fn main() -> Result<()> {
             if !state.running {
                 anyhow::bail!("Proxy is not running. Start it first with `ladder start`.");
             }
-            let mihomo_api = api::MihomoApi::new(cfg.ladder.control_port, cfg.ladder.api_secret.as_deref())?;
             let subs = cfg.filter_subscriptions(&subscriptions);
             if subs.is_empty() {
                 anyhow::bail!("No matching subscriptions to update.");
             }
+
+            // Smart update: detect format per subscription
             for s in &subs {
                 print!("Updating subscription: {}... ", s.name);
-                match mihomo_api.update_provider(&s.name).await {
-                    Ok(_) => println!("✓"),
-                    Err(e) => println!("✗ {}", e),
+                let _ = std::io::stdout().flush();
+
+                // Download and detect format
+                match mihomo::fetch_subscription(&s.url).await {
+                    Err(e) => {
+                        println!("✗ Fetch failed: {}", e);
+                        continue;
+                    }
+                    Ok(text) => {
+                        let fmt = mihomo::detect_subscription_format(&text);
+                        match fmt {
+                            mihomo::SubscriptionFormat::FullConfig => {
+                                // Re-merge and rewrite config, then reload mihomo
+                                match mihomo::merge_full_config(&text, &cfg) {
+                                    Err(e) => println!("✗ Merge failed: {}", e),
+                                    Ok(yaml) => {
+                                        let config_path = config::config_dir()?.join("mihomo-config.yaml");
+                                        std::fs::write(&config_path, &yaml)
+                                            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+                                        // Reload mihomo config via API
+                                        let mihomo_api = api::MihomoApi::new(
+                                            cfg.ladder.control_port,
+                                            cfg.ladder.api_secret.as_deref(),
+                                        )?;
+                                        match mihomo_api.reload_config(&config_path).await {
+                                            Ok(_) => println!("✓ (full-config, reloaded)"),
+                                            Err(_) => println!("✓ (full-config, written — restart to apply)"),
+                                        }
+                                    }
+                                }
+                            }
+                            mihomo::SubscriptionFormat::ProxyProvider => {
+                                // Use Mihomo API to update provider
+                                let mihomo_api = api::MihomoApi::new(
+                                    cfg.ladder.control_port,
+                                    cfg.ladder.api_secret.as_deref(),
+                                )?;
+                                match mihomo_api.update_provider(&s.name).await {
+                                    Ok(_) => println!("✓ (proxy-provider)"),
+                                    Err(e) => println!("✗ {}", e),
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
