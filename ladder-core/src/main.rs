@@ -305,6 +305,67 @@ async fn main() -> Result<()> {
             println!("  source {}", rc_file);
             println!();
             println!("Or open a new terminal window.");
+
+            // ── Step 4: Check mihomo ─────────────────────────────────────────
+            println!();
+            println!("━━━ Mihomo (Core Engine) ━━━");
+            println!();
+
+            let cache = config::cache_dir()?;
+            let cached_mihomo = cache.join("mihomo");
+
+            let has_mihomo = {
+                #[cfg(feature = "bundled")]
+                { true }
+                #[cfg(not(feature = "bundled"))]
+                { cached_mihomo.exists() }
+            };
+
+            if has_mihomo {
+                #[cfg(feature = "bundled")]
+                println!("✓ Mihomo is bundled in this binary.");
+                #[cfg(not(feature = "bundled"))]
+                println!("✓ Mihomo already cached  →  {}", cached_mihomo.display());
+            } else {
+                let target = mihomo::MihomoTarget::current()?;
+                println!("✗ Mihomo not found.");
+                println!();
+                println!("  Manual download:");
+                println!("    1. Visit: https://github.com/MetaCubeX/mihomo/releases/latest");
+                println!("    2. Download the asset for your platform:");
+                println!("         mihomo-{}-{}-<version>.gz", target.os, target.arch);
+                println!("    3. Decompress and place the binary at:");
+                println!("         {}", cached_mihomo.display());
+                println!("    4. Make it executable:  chmod +x {}", cached_mihomo.display());
+                println!();
+                print!("  Auto-download mihomo now? [y/N] ");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let input = input.trim().to_lowercase();
+
+                if input == "y" || input == "yes" {
+                    println!();
+                    std::fs::create_dir_all(&cache)?;
+                    println!("  Fetching latest mihomo version...");
+                    match mihomo::latest_mihomo_version().await {
+                        Ok(version) => {
+                            let url = target.download_url(&version);
+                            println!("  Downloading mihomo {} ...", version);
+                            println!("  URL: {}", url);
+                            match mihomo::download_mihomo(&cached_mihomo).await {
+                                Ok(()) => println!("  ✓ Mihomo {} installed  →  {}", version, cached_mihomo.display()),
+                                Err(e) => println!("  ✗ Download failed: {}\n    Please download manually.", e),
+                            }
+                        }
+                        Err(e) => println!("  ✗ Failed to fetch version info: {}\n    Please download manually.", e),
+                    }
+                } else {
+                    println!("  Skipped. Run `ladder install` again or download manually.");
+                }
+            }
         }
     }
 

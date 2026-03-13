@@ -111,7 +111,7 @@ fn extract_bundled(dest: &Path) -> Result<()> {
 
 // ─── Auto-download ────────────────────────────────────────────────────────────
 
-async fn download_mihomo(dest: &Path) -> Result<()> {
+pub(crate) async fn download_mihomo(dest: &Path) -> Result<()> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -148,7 +148,7 @@ async fn download_mihomo(dest: &Path) -> Result<()> {
 }
 
 /// Fetch the latest mihomo release version tag from GitHub API
-async fn latest_mihomo_version() -> Result<String> {
+pub(crate) async fn latest_mihomo_version() -> Result<String> {
     #[derive(serde::Deserialize)]
     struct Release {
         tag_name: String,
