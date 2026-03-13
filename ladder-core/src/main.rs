@@ -138,6 +138,36 @@ async fn main() -> Result<()> {
         }
 
         Some(Commands::Tui) => {
+            // Auto-start proxy if not running
+            let state = crate::env::RuntimeState::load()?;
+            if !state.running {
+                println!("Proxy is not running. Starting automatically...");
+                let cfg = LadderConfig::load()?;
+                if cfg.subscriptions.is_empty() {
+                    anyhow::bail!("No subscriptions configured. Run `ladder sub add <URL>` first.");
+                }
+                let subs = cfg.filter_subscriptions(&[]);
+                let bin_path = mihomo::get_mihomo_path(None).await?;
+                let config_path = mihomo::write_config_yaml(&cfg, &subs)?;
+                let proc = mihomo::spawn_mihomo(&bin_path, &config_path).await?;
+                let mihomo_pid = proc.pid;
+                // Leak the process handle so mihomo stays alive
+                std::mem::forget(proc);
+                let mut new_state = crate::env::RuntimeState {
+                    pid: Some(std::process::id()),
+                    mihomo_pid: Some(mihomo_pid),
+                    shell_pid: None,
+                    http_port: cfg.ladder.port,
+                    socks_port: cfg.ladder.socks_port,
+                    control_port: cfg.ladder.control_port,
+                    current_node: None,
+                    running: true,
+                };
+                new_state.save()?;
+                println!("✓ Proxy started (Mihomo PID: {})", mihomo_pid);
+                // Wait briefly for mihomo to initialize
+                tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+            }
             tui::run().await?;
         }
 

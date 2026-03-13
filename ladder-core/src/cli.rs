@@ -54,7 +54,7 @@ pub enum Commands {
     /// Print proxy env unset statements (for eval)
     Unenv,
 
-    /// Open TUI (connect to already-running proxy)
+    /// Open TUI (auto-starts proxy if not running)
     Tui,
 
     /// Show proxy status

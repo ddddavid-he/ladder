@@ -18,8 +18,8 @@ bundled = []  # embed mihomo binary at compile time via build.rs
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# HTTP client
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# HTTP client (rustls avoids OpenSSL dependency, required for musl static builds)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -58,7 +58,7 @@ flate2 = "1"
 
 [build-dependencies]
 # Used in build.rs for bundled feature
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 flate2 = "1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
