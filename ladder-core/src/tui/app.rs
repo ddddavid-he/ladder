@@ -417,10 +417,18 @@ fn build_node_list(
                     }
                     let info = proxies.get(node_name);
                     let delay = info.map(|i| i.latest_delay()).unwrap_or(0);
-                    // Try to determine provider name from the proxy info
+                    // Use provider-name from Mihomo API if available; otherwise
+                    // try to match against configured subscription names.
                     let sub_name = info
-                        .and_then(|i| i.extra.as_ref())
-                        .and_then(|_| None::<String>) // extra doesn't hold provider; fall back
+                        .and_then(|i| {
+                            i.provider_name.as_ref()
+                                .filter(|pn| !pn.is_empty())
+                                .cloned()
+                        })
+                        .or_else(|| {
+                            // In FullConfig mode without providers, use the first subscription name
+                            cfg.subscriptions.first().map(|s| s.name.clone())
+                        })
                         .unwrap_or_else(|| "default".to_string());
                     result.push(NodeEntry {
                         name: node_name.clone(),

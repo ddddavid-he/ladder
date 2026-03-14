@@ -339,8 +339,10 @@ async fn inspect_subscriptions<'a>(subs: &'a [&'a Subscription]) -> Result<Vec<F
 }
 
 /// Merge a full Clash config with ladder's port/controller settings.
-/// Overwrites mixed-port, socks-port, external-controller and secret,
-/// then serialises back to YAML string.
+/// Overwrites mixed-port, socks-port, external-controller and secret.
+/// Removes legacy port fields (`port`, `redir-port`, `tproxy-port`) that
+/// could conflict with `mixed-port`.
+/// Then serialises back to YAML string.
 pub fn merge_full_config(yaml_text: &str, cfg: &LadderConfig) -> Result<String> {
     let mut val: serde_yaml::Value =
         serde_yaml::from_str(yaml_text).context("Failed to parse subscription YAML")?;
@@ -358,6 +360,17 @@ pub fn merge_full_config(yaml_text: &str, cfg: &LadderConfig) -> Result<String> 
         };
     }
 
+    macro_rules! remove {
+        ($key:expr) => {
+            map.remove(&serde_yaml::Value::String($key.into()));
+        };
+    }
+
+    // Remove legacy port fields that conflict with mixed-port
+    remove!("port");
+    remove!("redir-port");
+    remove!("tproxy-port");
+
     set!("mixed-port", serde_yaml::Value::Number(cfg.ladder.port.into()));
     set!("socks-port", serde_yaml::Value::Number(cfg.ladder.socks_port.into()));
     set!(
@@ -366,6 +379,10 @@ pub fn merge_full_config(yaml_text: &str, cfg: &LadderConfig) -> Result<String> 
     );
     if let Some(secret) = &cfg.ladder.api_secret {
         set!("secret", serde_yaml::Value::String(secret.clone()));
+    } else {
+        // Remove any existing secret from the subscription config
+        // so Mihomo API is accessible without authentication
+        remove!("secret");
     }
 
     serde_yaml::to_string(&val).context("Failed to serialize merged config YAML")
@@ -621,14 +638,22 @@ pub async fn update_running_subscriptions(
             cfg.ladder.control_port,
             cfg.ladder.api_secret.as_deref(),
         )?;
-        let detail = match mihomo_api.reload_config(&config_path).await {
-            Ok(_) => "full-config, reloaded".to_string(),
-            Err(e) => format!("full-config, written — restart to apply ({})", e),
+
+        // Verify Mihomo API is reachable before attempting reload
+        let api_ready = mihomo_api.wait_ready(4).await.is_ok();
+
+        let (detail, success) = if !api_ready {
+            ("full-config, written — restart to apply (Mihomo API not reachable)".to_string(), false)
+        } else {
+            match mihomo_api.reload_config(&config_path).await {
+                Ok(_) => ("full-config, reloaded".to_string(), true),
+                Err(e) => (format!("full-config, written — restart to apply ({})", e), false),
+            }
         };
 
         return Ok(vec![SubscriptionUpdateReport {
             name: fetched_sub.sub.name.clone(),
-            success: true,
+            success,
             detail,
         }]);
     }
@@ -870,6 +895,47 @@ rules:
             .as_str()
             .unwrap();
         assert!(ctrl.contains(&cfg.ladder.control_port.to_string()));
+    }
+
+    #[test]
+    fn test_merge_full_config_removes_legacy_port() {
+        // Simulates a full-config subscription like WestWorld.yaml:
+        // has `port: 7890` but no `mixed-port`. After merge, `port` should be
+        // removed and `mixed-port` should be set instead.
+        let yaml = r#"
+port: 7890
+socks-port: 7891
+external-controller: "127.0.0.1:9090"
+allow-lan: true
+mode: Rule
+log-level: info
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
+"#;
+        let cfg = make_config();
+        let merged = merge_full_config(yaml, &cfg).unwrap();
+        let val: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+        let map = val.as_mapping().unwrap();
+
+        // `port` must be removed to avoid conflict with `mixed-port`
+        assert!(
+            !map.contains_key(&serde_yaml::Value::String("port".into())),
+            "Legacy 'port' field should be removed after merge"
+        );
+
+        // `mixed-port` must be set
+        assert_eq!(
+            map[&serde_yaml::Value::String("mixed-port".into())],
+            serde_yaml::Value::Number(cfg.ladder.port.into())
+        );
+
+        // `secret` should not be present (ladder config has no api_secret)
+        assert!(
+            !map.contains_key(&serde_yaml::Value::String("secret".into())),
+            "Secret should not be present when ladder config has no api_secret"
+        );
     }
 
 }

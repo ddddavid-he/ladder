@@ -128,7 +128,23 @@ async fn main() -> Result<()> {
                 if let Err(e) = mihomo_api.wait_ready(10).await {
                     tracing::warn!("API not ready for auto-best: {}", e);
                 } else {
-                    match mihomo_api.auto_best("PROXY", "https://www.gstatic.com/generate_204").await {
+                    // Detect the main proxy group dynamically
+                    let group_name = match mihomo_api.get_proxies().await {
+                        Ok(proxies) => {
+                            let candidates = ["PROXY", "🔰 节点选择", "节点选择", "Proxy"];
+                            candidates.iter()
+                                .find(|name| proxies.contains_key(**name))
+                                .map(|s| s.to_string())
+                                .or_else(|| {
+                                    proxies.iter()
+                                        .find(|(_, info)| info.proxy_type.eq_ignore_ascii_case("Selector") && info.all.is_some())
+                                        .map(|(name, _)| name.clone())
+                                })
+                                .unwrap_or_else(|| "PROXY".to_string())
+                        }
+                        Err(_) => "PROXY".to_string(),
+                    };
+                    match mihomo_api.auto_best(&group_name, "https://www.gstatic.com/generate_204").await {
                         Ok((node, delay)) => tracing::info!("Auto-best: {} ({}ms)", node, delay),
                         Err(e) => tracing::warn!("Auto-best failed: {}", e),
                     }
@@ -194,8 +210,11 @@ async fn main() -> Result<()> {
                 };
                 new_state.save()?;
                 println!("✓ Proxy started (Mihomo PID: {})", mihomo_pid);
-                // Wait briefly for mihomo to initialize
-                tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+                // Wait for Mihomo API to become ready before entering TUI
+                let mihomo_api = api::MihomoApi::new(cfg.ladder.control_port, cfg.ladder.api_secret.as_deref())?;
+                if let Err(e) = mihomo_api.wait_ready(10).await {
+                    tracing::warn!("Mihomo API slow to start: {}", e);
+                }
             }
             tui::run().await?;
         }
@@ -261,6 +280,12 @@ async fn main() -> Result<()> {
             let state = crate::env::RuntimeState::load()?;
             if !state.running {
                 anyhow::bail!("Proxy is not running. Start it first with `ladder start`.");
+            }
+            // Verify the mihomo process is actually alive (state file may be stale)
+            if let Some(pid) = state.mihomo_pid {
+                if !watchdog::is_pid_alive(pid) {
+                    tracing::warn!("Mihomo PID {} is no longer running (stale state)", pid);
+                }
             }
             let subs = cfg.filter_subscriptions(&subscriptions);
             if subs.is_empty() {

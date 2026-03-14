@@ -75,12 +75,21 @@ impl MihomoApi {
         struct Resp {
             proxies: HashMap<String, ProxyInfo>,
         }
-        let resp = self
+        let resp = match self
             .client
             .get(format!("{}/proxies", self.base_url))
             .send()
             .await
-            .context("GET /proxies failed")?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                bail!(
+                    "GET /proxies failed — Mihomo API unreachable at {} (is mihomo running?): {}",
+                    self.base_url,
+                    e
+                );
+            }
+        };
 
         let status = resp.status();
         let text = resp
@@ -89,12 +98,13 @@ impl MihomoApi {
             .context("Failed to read /proxies response body")?;
 
         if !status.is_success() {
-            bail!("/proxies returned HTTP {}: {}", status, &text[..text.len().min(200)]);
+            let preview: String = text.chars().take(200).collect();
+            bail!("/proxies returned HTTP {}: {}", status, preview);
         }
 
         let r: Resp = serde_json::from_str(&text)
             .with_context(|| {
-                let preview = &text[..text.len().min(500)];
+                let preview: String = text.chars().take(500).collect();
                 format!(
                     "Failed to parse /proxies response (len={}).\nPreview: {}",
                     text.len(),
@@ -204,7 +214,7 @@ impl MihomoApi {
     ///
     /// Strategy:
     /// 1. Try sending config content via `payload` field (avoids Mihomo's IsSafePath check).
-    /// 2. If that fails, fall back to sending `path` field.
+    /// 2. If that fails with an HTTP error, fall back to sending `path` field.
     pub async fn reload_config(&self, config_path: &std::path::Path) -> Result<()> {
         let url = format!("{}/configs?force=true", self.base_url);
 
@@ -212,13 +222,23 @@ impl MihomoApi {
         let yaml_content = std::fs::read_to_string(config_path)
             .with_context(|| format!("Cannot read config file: {}", config_path.display()))?;
 
-        let resp = self
+        let resp = match self
             .client
             .put(&url)
             .json(&serde_json::json!({ "payload": yaml_content }))
             .send()
             .await
-            .context("PUT /configs?force=true (payload) failed")?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Connection-level failure: Mihomo API is unreachable
+                bail!(
+                    "Mihomo API unreachable at {} (is mihomo running?): {}",
+                    self.base_url,
+                    e
+                );
+            }
+        };
 
         if resp.status().is_success() {
             info!("Mihomo config reloaded via payload from {}", config_path.display());
@@ -227,7 +247,8 @@ impl MihomoApi {
 
         let status1 = resp.status();
         let body1 = resp.text().await.unwrap_or_default();
-        debug!("Reload via payload failed: HTTP {} — {}", status1, &body1[..body1.len().min(200)]);
+        let body1_preview: String = body1.chars().take(200).collect();
+        debug!("Reload via payload failed: HTTP {} — {}", status1, body1_preview);
 
         // Strategy 2: fall back to sending file path
         let resp = self
@@ -236,7 +257,7 @@ impl MihomoApi {
             .json(&serde_json::json!({ "path": config_path.to_string_lossy() }))
             .send()
             .await
-            .context("PUT /configs?force=true (path) failed")?;
+            .with_context(|| format!("Mihomo API unreachable at {}", self.base_url))?;
 
         if resp.status().is_success() {
             info!("Mihomo config reloaded via path from {}", config_path.display());
@@ -245,10 +266,11 @@ impl MihomoApi {
 
         let status2 = resp.status();
         let body2 = resp.text().await.unwrap_or_default();
+        let body2_preview: String = body2.chars().take(200).collect();
         bail!(
             "Reload config failed.\n  payload attempt: HTTP {} — {}\n  path attempt: HTTP {} — {}",
-            status1, &body1[..body1.len().min(200)],
-            status2, &body2[..body2.len().min(200)],
+            status1, body1_preview,
+            status2, body2_preview,
         )
     }
 
@@ -336,6 +358,9 @@ pub struct ProxyInfo {
     pub history: Option<Vec<HistoryEntry>>,
     /// Whether the proxy is alive
     pub alive: Option<bool>,
+    /// Provider name (non-empty when the proxy comes from a proxy-provider)
+    #[serde(rename = "provider-name", default)]
+    pub provider_name: Option<String>,
     /// Extra delay histories per test URL (mihomo returns map[string]ProxyState)
     #[serde(default)]
     pub extra: Option<serde_json::Value>,
@@ -419,6 +444,7 @@ mod tests {
             all: None,
             history: None,
             alive: None,
+            provider_name: None,
             extra: None,
         };
         assert_eq!(p.latest_delay(), 0);
@@ -436,6 +462,7 @@ mod tests {
                 HistoryEntry { time: "2024-01-02".to_string(), delay: 23 },
             ]),
             alive: Some(true),
+            provider_name: None,
             extra: None,
         };
         assert_eq!(p.latest_delay(), 23);
