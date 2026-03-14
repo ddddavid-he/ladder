@@ -75,15 +75,32 @@ impl MihomoApi {
         struct Resp {
             proxies: HashMap<String, ProxyInfo>,
         }
-        let r: Resp = self
+        let resp = self
             .client
             .get(format!("{}/proxies", self.base_url))
             .send()
             .await
-            .context("GET /proxies failed")?
-            .json()
+            .context("GET /proxies failed")?;
+
+        let status = resp.status();
+        let text = resp
+            .text()
             .await
-            .context("Failed to parse /proxies response")?;
+            .context("Failed to read /proxies response body")?;
+
+        if !status.is_success() {
+            bail!("/proxies returned HTTP {}: {}", status, &text[..text.len().min(200)]);
+        }
+
+        let r: Resp = serde_json::from_str(&text)
+            .with_context(|| {
+                let preview = &text[..text.len().min(500)];
+                format!(
+                    "Failed to parse /proxies response (len={}).\nPreview: {}",
+                    text.len(),
+                    preview,
+                )
+            })?;
         Ok(r.proxies)
     }
 
@@ -277,17 +294,22 @@ fn urlencoding(s: &str) -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyInfo {
+    #[serde(default)]
     pub name: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub proxy_type: String,
     /// Current selected node (for select/url-test groups)
     pub now: Option<String>,
     /// All nodes in this group
     pub all: Option<Vec<String>>,
     /// Latency history
+    #[serde(default)]
     pub history: Option<Vec<HistoryEntry>>,
     /// Whether the proxy is alive
     pub alive: Option<bool>,
+    /// Extra delay histories per test URL (mihomo returns map[string]ProxyState)
+    #[serde(default)]
+    pub extra: Option<serde_json::Value>,
 }
 
 impl ProxyInfo {
@@ -303,8 +325,36 @@ impl ProxyInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistoryEntry {
+    #[serde(default)]
     pub time: String,
+    #[serde(default, deserialize_with = "deserialize_delay")]
     pub delay: u64,
+}
+
+/// Deserialize delay field flexibly: accept integers, floats, or strings
+fn deserialize_delay<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct DelayVisitor;
+    impl<'de> de::Visitor<'de> for DelayVisitor {
+        type Value = u64;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number or numeric string")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<u64, E> { Ok(v) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<u64, E> {
+            Ok(if v < 0 { 0 } else { v as u64 })
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<u64, E> {
+            Ok(if v < 0.0 { 0 } else { v as u64 })
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<u64, E> {
+            v.parse::<u64>().map_err(de::Error::custom)
+        }
+    }
+    deserializer.deserialize_any(DelayVisitor)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -340,6 +390,7 @@ mod tests {
             all: None,
             history: None,
             alive: None,
+            extra: None,
         };
         assert_eq!(p.latest_delay(), 0);
     }
@@ -356,8 +407,130 @@ mod tests {
                 HistoryEntry { time: "2024-01-02".to_string(), delay: 23 },
             ]),
             alive: Some(true),
+            extra: None,
         };
         assert_eq!(p.latest_delay(), 23);
+    }
+
+    #[test]
+    fn test_parse_mihomo_proxies_response() {
+        // Simulated Mihomo /proxies response with all the fields it actually returns
+        let json = r#"{
+            "proxies": {
+                "DIRECT": {
+                    "type": "Direct",
+                    "id": "some-uuid",
+                    "name": "DIRECT",
+                    "alive": true,
+                    "udp": true,
+                    "uot": false,
+                    "xudp": false,
+                    "tfo": false,
+                    "mptcp": false,
+                    "smux": false,
+                    "interface": "",
+                    "routing-mark": 0,
+                    "provider-name": "",
+                    "dialer-proxy": "",
+                    "history": [],
+                    "extra": {}
+                },
+                "🔰 节点选择": {
+                    "type": "Selector",
+                    "now": "HK-01",
+                    "all": ["HK-01", "JP-01", "US-01"],
+                    "testUrl": "",
+                    "hidden": false,
+                    "icon": "",
+                    "name": "🔰 节点选择",
+                    "alive": true,
+                    "udp": true,
+                    "uot": false,
+                    "xudp": false,
+                    "tfo": false,
+                    "mptcp": false,
+                    "smux": false,
+                    "interface": "",
+                    "routing-mark": 0,
+                    "provider-name": "",
+                    "dialer-proxy": "",
+                    "history": [],
+                    "extra": {}
+                },
+                "♻️ 自动选择": {
+                    "type": "URLTest",
+                    "now": "HK-01",
+                    "all": ["HK-01", "JP-01"],
+                    "testUrl": "https://www.gstatic.com/generate_204",
+                    "expectedStatus": "",
+                    "fixed": "",
+                    "hidden": false,
+                    "icon": "",
+                    "name": "♻️ 自动选择",
+                    "alive": true,
+                    "udp": true,
+                    "uot": false,
+                    "xudp": false,
+                    "tfo": false,
+                    "mptcp": false,
+                    "smux": false,
+                    "interface": "",
+                    "routing-mark": 0,
+                    "provider-name": "",
+                    "dialer-proxy": "",
+                    "history": [
+                        {"time": "2024-03-14T12:00:00.000Z", "delay": 23}
+                    ],
+                    "extra": {
+                        "https://www.gstatic.com/generate_204": {
+                            "alive": true,
+                            "history": [
+                                {"time": "2024-03-14T12:00:00.000Z", "delay": 23}
+                            ]
+                        }
+                    }
+                },
+                "HK-01": {
+                    "type": "Trojan",
+                    "id": "uuid-hk01",
+                    "name": "HK-01",
+                    "alive": true,
+                    "udp": true,
+                    "uot": false,
+                    "xudp": false,
+                    "tfo": false,
+                    "mptcp": false,
+                    "smux": false,
+                    "interface": "",
+                    "routing-mark": 0,
+                    "provider-name": "WestWorld",
+                    "dialer-proxy": "",
+                    "history": [
+                        {"time": "2024-03-14T12:00:00.000Z", "delay": 45}
+                    ],
+                    "extra": {
+                        "https://www.gstatic.com/generate_204": {
+                            "alive": true,
+                            "history": [
+                                {"time": "2024-03-14T12:00:00.000Z", "delay": 45}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        #[derive(Deserialize)]
+        struct Resp {
+            proxies: HashMap<String, ProxyInfo>,
+        }
+
+        let r: Resp = serde_json::from_str(json).expect("Should parse Mihomo proxies response");
+        assert_eq!(r.proxies.len(), 4);
+        assert_eq!(r.proxies["DIRECT"].proxy_type, "Direct");
+        assert_eq!(r.proxies["🔰 节点选择"].now, Some("HK-01".to_string()));
+        assert_eq!(r.proxies["♻️ 自动选择"].all.as_ref().unwrap().len(), 2);
+        assert_eq!(r.proxies["HK-01"].latest_delay(), 45);
     }
 
     #[test]
