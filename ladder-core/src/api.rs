@@ -200,27 +200,56 @@ impl MihomoApi {
         }
     }
 
-    /// PUT /configs?force=true - Reload mihomo config from file
+    /// PUT /configs?force=true - Reload mihomo config.
+    ///
+    /// Strategy:
+    /// 1. Try sending config content via `payload` field (avoids Mihomo's IsSafePath check).
+    /// 2. If that fails, fall back to sending `path` field.
     pub async fn reload_config(&self, config_path: &std::path::Path) -> Result<()> {
-        #[derive(serde::Serialize)]
-        struct Body {
-            path: String,
-        }
+        let url = format!("{}/configs?force=true", self.base_url);
+
+        // Strategy 1: send config content directly via `payload`
+        let yaml_content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Cannot read config file: {}", config_path.display()))?;
+
         let resp = self
             .client
-            .put(format!("{}/configs?force=true", self.base_url))
-            .json(&Body {
-                path: config_path.to_string_lossy().to_string(),
-            })
+            .put(&url)
+            .json(&serde_json::json!({ "payload": yaml_content }))
             .send()
             .await
-            .context("PUT /configs?force=true failed")?;
+            .context("PUT /configs?force=true (payload) failed")?;
+
         if resp.status().is_success() {
-            info!("Mihomo config reloaded from {}", config_path.display());
-            Ok(())
-        } else {
-            bail!("Reload config failed: HTTP {}", resp.status())
+            info!("Mihomo config reloaded via payload from {}", config_path.display());
+            return Ok(());
         }
+
+        let status1 = resp.status();
+        let body1 = resp.text().await.unwrap_or_default();
+        debug!("Reload via payload failed: HTTP {} — {}", status1, &body1[..body1.len().min(200)]);
+
+        // Strategy 2: fall back to sending file path
+        let resp = self
+            .client
+            .put(&url)
+            .json(&serde_json::json!({ "path": config_path.to_string_lossy() }))
+            .send()
+            .await
+            .context("PUT /configs?force=true (path) failed")?;
+
+        if resp.status().is_success() {
+            info!("Mihomo config reloaded via path from {}", config_path.display());
+            return Ok(());
+        }
+
+        let status2 = resp.status();
+        let body2 = resp.text().await.unwrap_or_default();
+        bail!(
+            "Reload config failed.\n  payload attempt: HTTP {} — {}\n  path attempt: HTTP {} — {}",
+            status1, &body1[..body1.len().min(200)],
+            status2, &body2[..body2.len().min(200)],
+        )
     }
 
     // ─── Auto-Best selection ─────────────────────────────────────────────────
