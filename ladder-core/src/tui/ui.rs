@@ -173,15 +173,15 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
 
     // Left: status message
     let status_text = if let Some(msg) = &app.status_msg {
-        msg.as_str()
+        msg.clone()
     } else if let Some(node) = &app.current_node {
-        &format!("当前节点: {}", node)
+        format!("当前节点: {}", node)
     } else {
-        "无当前节点"
+        "无当前节点".to_string()
     };
 
     let status_line = app.status_msg.as_deref().map(|_| {
-        Paragraph::new(status_text)
+        Paragraph::new(status_text.clone())
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL))
     }).unwrap_or_else(|| {

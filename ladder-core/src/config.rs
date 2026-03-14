@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -96,6 +96,54 @@ pub struct Subscription {
 
 fn default_interval() -> u64 { 86400 }
 
+pub fn validate_subscription_url(raw_url: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw_url)
+        .with_context(|| format!("Invalid subscription URL: {}", raw_url))?;
+
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        scheme => bail!(
+            "Unsupported subscription URL scheme '{}': only http/https are allowed",
+            scheme
+        ),
+    }
+}
+
+pub fn default_subscription_name_from_url(raw_url: &str) -> Result<String> {
+    let url = validate_subscription_url(raw_url)?;
+    let last_segment = url
+        .path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).last())
+        .unwrap_or_default();
+
+    let candidate = strip_yaml_suffix(last_segment).trim();
+    let fallback = url.host_str().unwrap_or("subscription").trim();
+
+    let display_name = if !candidate.is_empty() {
+        candidate
+    } else if !fallback.is_empty() {
+        fallback
+    } else {
+        "subscription"
+    };
+
+    Ok(display_name.to_string())
+}
+
+pub fn subscription_name_matches(left: &str, right: &str) -> bool {
+    left == right || normalize_subscription_name(left) == normalize_subscription_name(right)
+}
+
+fn normalize_subscription_name(name: &str) -> String {
+    strip_yaml_suffix(name.trim()).to_ascii_lowercase()
+}
+
+fn strip_yaml_suffix(name: &str) -> &str {
+    name.strip_suffix(".yaml")
+        .or_else(|| name.strip_suffix(".yml"))
+        .unwrap_or(name)
+}
+
 impl LadderConfig {
     /// 读取配置文件，若不存在则返回默认值
     pub fn load() -> Result<Self> {
@@ -119,13 +167,17 @@ impl LadderConfig {
     }
 
     /// 获取指定名称的订阅
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_subscription(&self, name: &str) -> Option<&Subscription> {
-        self.subscriptions.iter().find(|s| s.name == name)
+        self.subscriptions
+            .iter()
+            .find(|s| subscription_name_matches(&s.name, name))
     }
 
     /// 添加订阅（名称已存在则更新 URL）
     pub fn add_subscription(&mut self, sub: Subscription) {
-        if let Some(existing) = self.subscriptions.iter_mut().find(|s| s.name == sub.name) {
+        if let Some(existing) = self.subscriptions.iter_mut().find(|s| subscription_name_matches(&s.name, &sub.name)) {
+            existing.name = sub.name;
             existing.url = sub.url;
             existing.interval = sub.interval;
         } else {
@@ -136,7 +188,8 @@ impl LadderConfig {
     /// 删除订阅
     pub fn remove_subscription(&mut self, name: &str) -> bool {
         let before = self.subscriptions.len();
-        self.subscriptions.retain(|s| s.name != name);
+        self.subscriptions
+            .retain(|s| !subscription_name_matches(&s.name, name));
         self.subscriptions.len() < before
     }
 
@@ -147,7 +200,7 @@ impl LadderConfig {
         } else {
             self.subscriptions
                 .iter()
-                .filter(|s| names.contains(&s.name))
+                .filter(|s| names.iter().any(|name| subscription_name_matches(&s.name, name)))
                 .collect()
         }
     }
@@ -179,7 +232,7 @@ mod tests {
     fn test_add_remove_subscription() {
         let mut cfg = LadderConfig::default();
         cfg.add_subscription(Subscription {
-            name: "机场A".to_string(),
+            name: "机场A.yaml".to_string(),
             url: "https://example.com/sub".to_string(),
             interval: 86400,
         });
@@ -194,7 +247,7 @@ mod tests {
     #[test]
     fn test_filter_subscriptions() {
         let mut cfg = LadderConfig::default();
-        cfg.add_subscription(Subscription { name: "A".to_string(), url: "u1".to_string(), interval: 86400 });
+        cfg.add_subscription(Subscription { name: "A.yaml".to_string(), url: "u1".to_string(), interval: 86400 });
         cfg.add_subscription(Subscription { name: "B".to_string(), url: "u2".to_string(), interval: 86400 });
         cfg.add_subscription(Subscription { name: "C".to_string(), url: "u3".to_string(), interval: 86400 });
 
@@ -217,5 +270,18 @@ mod tests {
         let deserialized: LadderConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.subscriptions[0].name, "测试");
         assert_eq!(deserialized.subscriptions[0].interval, 43200);
+    }
+
+    #[test]
+    fn test_validate_subscription_url() {
+        assert!(validate_subscription_url("https://example.com/sub.yaml").is_ok());
+        assert!(validate_subscription_url("http://example.com/sub.yaml").is_ok());
+        assert!(validate_subscription_url("file:///tmp/sub.yaml").is_err());
+    }
+
+    #[test]
+    fn test_default_subscription_name_from_url() {
+        let name = default_subscription_name_from_url("https://files.ddddavid.cn/private/WestWorld.yaml?token=abc").unwrap();
+        assert_eq!(name, "WestWorld");
     }
 }

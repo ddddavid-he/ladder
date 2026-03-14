@@ -6,12 +6,39 @@ mod watchdog;
 mod api;
 mod tui;
 
-use std::io::Write;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, SubCommands};
 use config::{LadderConfig, Subscription};
+
+fn add_subscription_from_args(
+    cfg: &mut LadderConfig,
+    url: String,
+    name: Option<String>,
+    interval: u64,
+) -> Result<String> {
+    config::validate_subscription_url(&url)?;
+
+    let display_name = match name {
+        Some(name) => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("Subscription name cannot be empty.");
+            }
+            trimmed.to_string()
+        }
+        None => config::default_subscription_name_from_url(&url)?,
+    };
+
+    cfg.add_subscription(Subscription {
+        name: display_name.clone(),
+        url,
+        interval,
+    });
+    cfg.save()?;
+
+    Ok(display_name)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,7 +93,7 @@ async fn main() -> Result<()> {
             let mihomo_pid = proc.pid;
 
             // Save runtime state
-            let mut state = crate::env::RuntimeState {
+            let state = crate::env::RuntimeState {
                 pid: Some(std::process::id()),
                 mihomo_pid: Some(mihomo_pid),
                 shell_pid,
@@ -149,12 +176,13 @@ async fn main() -> Result<()> {
                 }
                 let subs = cfg.filter_subscriptions(&[]);
                 let bin_path = mihomo::get_mihomo_path(None).await?;
-                let config_path = mihomo::write_config_yaml(&cfg, &subs)?;
+                let (config_path, strategy) = mihomo::smart_write_config_yaml(&cfg, &subs).await?;
+                tracing::info!("Config strategy: {}", strategy);
                 let proc = mihomo::spawn_mihomo(&bin_path, &config_path).await?;
                 let mihomo_pid = proc.pid;
                 // Leak the process handle so mihomo stays alive
                 std::mem::forget(proc);
-                let mut new_state = crate::env::RuntimeState {
+                let new_state = crate::env::RuntimeState {
                     pid: Some(std::process::id()),
                     mihomo_pid: Some(mihomo_pid),
                     shell_pid: None,
@@ -194,21 +222,7 @@ async fn main() -> Result<()> {
             let mut cfg = LadderConfig::load()?;
             match action {
                 SubCommands::Add { url, name, interval } => {
-                    let display_name = name.unwrap_or_else(|| {
-                        // 从 URL 中提取简短名
-                        url.split('/').last()
-                            .unwrap_or("subscription")
-                            .split('?')
-                            .next()
-                            .unwrap_or("subscription")
-                            .to_string()
-                    });
-                    cfg.add_subscription(Subscription {
-                        name: display_name.clone(),
-                        url,
-                        interval,
-                    });
-                    cfg.save()?;
+                    let display_name = add_subscription_from_args(&mut cfg, url, name, interval)?;
                     println!("✓ Added subscription: {}", display_name);
                 }
 
@@ -236,6 +250,12 @@ async fn main() -> Result<()> {
             }
         }
 
+        Some(Commands::Add { url, name, interval }) => {
+            let mut cfg = LadderConfig::load()?;
+            let display_name = add_subscription_from_args(&mut cfg, url, name, interval)?;
+            println!("✓ Added subscription: {}", display_name);
+        }
+
         Some(Commands::Update { subscriptions }) => {
             let cfg = LadderConfig::load()?;
             let state = crate::env::RuntimeState::load()?;
@@ -247,53 +267,12 @@ async fn main() -> Result<()> {
                 anyhow::bail!("No matching subscriptions to update.");
             }
 
-            // Smart update: detect format per subscription
-            for s in &subs {
-                print!("Updating subscription: {}... ", s.name);
-                let _ = std::io::stdout().flush();
-
-                // Download and detect format
-                match mihomo::fetch_subscription(&s.url).await {
-                    Err(e) => {
-                        println!("✗ Fetch failed: {}", e);
-                        continue;
-                    }
-                    Ok(text) => {
-                        let fmt = mihomo::detect_subscription_format(&text);
-                        match fmt {
-                            mihomo::SubscriptionFormat::FullConfig => {
-                                // Re-merge and rewrite config, then reload mihomo
-                                match mihomo::merge_full_config(&text, &cfg) {
-                                    Err(e) => println!("✗ Merge failed: {}", e),
-                                    Ok(yaml) => {
-                                        let config_path = config::config_dir()?.join("mihomo-config.yaml");
-                                        std::fs::write(&config_path, &yaml)
-                                            .with_context(|| format!("Failed to write {}", config_path.display()))?;
-                                        // Reload mihomo config via API
-                                        let mihomo_api = api::MihomoApi::new(
-                                            cfg.ladder.control_port,
-                                            cfg.ladder.api_secret.as_deref(),
-                                        )?;
-                                        match mihomo_api.reload_config(&config_path).await {
-                                            Ok(_) => println!("✓ (full-config, reloaded)"),
-                                            Err(_) => println!("✓ (full-config, written — restart to apply)"),
-                                        }
-                                    }
-                                }
-                            }
-                            mihomo::SubscriptionFormat::ProxyProvider => {
-                                // Use Mihomo API to update provider
-                                let mihomo_api = api::MihomoApi::new(
-                                    cfg.ladder.control_port,
-                                    cfg.ladder.api_secret.as_deref(),
-                                )?;
-                                match mihomo_api.update_provider(&s.name).await {
-                                    Ok(_) => println!("✓ (proxy-provider)"),
-                                    Err(e) => println!("✗ {}", e),
-                                }
-                            }
-                        }
-                    }
+            let reports = mihomo::update_running_subscriptions(&cfg, &subs).await?;
+            for report in reports {
+                if report.success {
+                    println!("✓ {} ({})", report.name, report.detail);
+                } else {
+                    println!("✗ {}: {}", report.name, report.detail);
                 }
             }
         }

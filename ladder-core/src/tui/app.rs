@@ -205,7 +205,7 @@ impl App {
     /// Run speed test on all visible nodes
     pub async fn run_speed_test(&mut self) {
         let api = match &self.api {
-            Some(a) => MihomoApi::new(
+            Some(_) => MihomoApi::new(
                 self.state.control_port,
                 self.cfg.ladder.api_secret.as_deref(),
             ).ok(),
@@ -270,26 +270,29 @@ impl App {
         self.mode = AppMode::Normal;
     }
 
-    /// Force-update all subscription providers
+    /// Force-update all subscriptions
     pub async fn update_providers(&mut self) {
-        let api = match &self.api {
-            Some(_) => MihomoApi::new(
-                self.state.control_port,
-                self.cfg.ladder.api_secret.as_deref(),
-            ).ok(),
-            None => return,
-        };
-        let Some(api) = api else { return };
+        if self.api.is_none() {
+            return;
+        }
 
         self.set_status("更新订阅中...".to_string());
 
-        let names: Vec<String> = self.cfg.subscriptions.iter().map(|s| s.name.clone()).collect();
-        for name in &names {
-            let _ = api.update_provider(name).await;
+        let subs: Vec<_> = self.cfg.subscriptions.iter().collect();
+        match crate::mihomo::update_running_subscriptions(&self.cfg, &subs).await {
+            Ok(reports) => {
+                let failed = reports.iter().filter(|report| !report.success).count();
+                if failed == 0 {
+                    self.set_status(format!("✓ 已更新 {} 个订阅", reports.len()));
+                } else {
+                    self.set_status(format!("更新完成，{} 个成功，{} 个失败", reports.len() - failed, failed));
+                }
+                self.refresh_nodes().await;
+            }
+            Err(e) => {
+                self.set_status(format!("更新失败: {}", e));
+            }
         }
-
-        self.set_status("✓ 订阅已更新".to_string());
-        self.refresh_nodes().await;
     }
 
     pub fn set_status(&mut self, msg: String) {

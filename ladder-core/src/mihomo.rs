@@ -4,6 +4,7 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::{debug, info, warn};
 
+use crate::api::MihomoApi;
 use crate::config::{config_dir, data_dir, LadderConfig, Subscription};
 
 // ─── Bundled binary (compile-time embedded) ───────────────────────────────────
@@ -183,36 +184,89 @@ fn set_executable(path: &Path) -> Result<()> {
 // ─── Subscription format detection ───────────────────────────────────────────
 
 /// Detected format of a subscription file
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionFormat {
-    /// Full Clash/Mihomo config (has `proxies` + `rules` or `proxy-groups`)
+    /// Full Clash/Mihomo config
     FullConfig,
     /// Only a proxies list, suitable for proxy-provider
     ProxyProvider,
+    /// Not a supported Mihomo/Clash YAML document
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubscriptionUpdateReport {
+    pub name: String,
+    pub success: bool,
+    pub detail: String,
+}
+
+#[derive(Debug)]
+struct FetchedSubscription<'a> {
+    sub: &'a Subscription,
+    text: String,
+    format: SubscriptionFormat,
+}
+
+fn has_yaml_key(map: &serde_yaml::Mapping, key: &str) -> bool {
+    map.contains_key(&serde_yaml::Value::String(key.into()))
+}
+
+fn preview_text(text: &str) -> String {
+    let normalized = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut preview = normalized.chars().take(160).collect::<String>();
+    if normalized.chars().count() > 160 {
+        preview.push('…');
+    }
+    preview
 }
 
 /// Detect the format of a downloaded subscription YAML.
-/// Returns `FullConfig` if the document contains both a `proxies` key and at
-/// least one of `rules` / `proxy-groups` / `mode` (i.e. looks like a complete
-/// Clash config).  Otherwise returns `ProxyProvider`.
 pub fn detect_subscription_format(yaml_text: &str) -> SubscriptionFormat {
     let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(yaml_text) else {
-        return SubscriptionFormat::ProxyProvider;
+        return SubscriptionFormat::Unknown;
     };
     let map = match &val {
         serde_yaml::Value::Mapping(m) => m,
-        _ => return SubscriptionFormat::ProxyProvider,
+        _ => return SubscriptionFormat::Unknown,
     };
 
-    let has_proxies = map.contains_key(&serde_yaml::Value::String("proxies".into()));
-    let has_config_keys = map.contains_key(&serde_yaml::Value::String("rules".into()))
-        || map.contains_key(&serde_yaml::Value::String("proxy-groups".into()))
-        || map.contains_key(&serde_yaml::Value::String("mode".into()));
+    let has_proxies = has_yaml_key(map, "proxies");
+    let has_full_config_keys = [
+        "rules",
+        "proxy-groups",
+        "proxy-providers",
+        "rule-providers",
+        "mode",
+        "mixed-port",
+        "port",
+        "socks-port",
+        "redir-port",
+        "tproxy-port",
+        "external-controller",
+        "secret",
+        "dns",
+        "tun",
+        "listeners",
+        "sniffer",
+        "hosts",
+    ]
+    .iter()
+    .any(|key| has_yaml_key(map, key));
 
-    if has_proxies && has_config_keys {
+    if has_full_config_keys {
         SubscriptionFormat::FullConfig
-    } else {
+    } else if has_proxies {
         SubscriptionFormat::ProxyProvider
+    } else {
+        SubscriptionFormat::Unknown
     }
 }
 
@@ -227,10 +281,61 @@ pub async fn fetch_subscription(url: &str) -> Result<String> {
         .send()
         .await
         .with_context(|| format!("Failed to fetch subscription: {}", url))?;
-    if !resp.status().is_success() {
-        bail!("Subscription fetch failed: HTTP {}", resp.status());
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let text = resp
+        .text()
+        .await
+        .context("Failed to read subscription body")?;
+
+    if !status.is_success() {
+        let preview = preview_text(&text);
+        let content_type = content_type.unwrap_or_else(|| "unknown content-type".to_string());
+        if preview.is_empty() {
+            bail!("Subscription fetch failed: HTTP {} ({})", status, content_type);
+        }
+        bail!(
+            "Subscription fetch failed: HTTP {} ({}) — {}",
+            status,
+            content_type,
+            preview
+        );
     }
-    resp.text().await.context("Failed to read subscription body")
+
+    if text.trim().is_empty() {
+        bail!("Subscription response is empty: {}", url);
+    }
+
+    Ok(text)
+}
+
+async fn inspect_subscriptions<'a>(subs: &'a [&'a Subscription]) -> Result<Vec<FetchedSubscription<'a>>> {
+    let mut fetched = Vec::new();
+
+    for &sub in subs {
+        let text = fetch_subscription(&sub.url)
+            .await
+            .with_context(|| format!("Failed to fetch subscription: {}", sub.name))?;
+        let format = detect_subscription_format(&text);
+        info!("Subscription '{}' detected as: {:?}", sub.name, format);
+
+        if format == SubscriptionFormat::Unknown {
+            bail!(
+                "Subscription '{}' is not a supported Mihomo/Clash YAML document. Response preview: {}",
+                sub.name,
+                preview_text(&text)
+            );
+        }
+
+        fetched.push(FetchedSubscription { sub, text, format });
+    }
+
+    Ok(fetched)
 }
 
 /// Merge a full Clash config with ladder's port/controller settings.
@@ -446,7 +551,7 @@ pub fn write_config_yaml(cfg: &LadderConfig, subs: &[&Subscription]) -> Result<P
 ///
 /// - Single `FullConfig`: merges port/controller settings directly into it.
 /// - All `ProxyProvider`: uses the standard proxy-provider generation.
-/// - Mixed / multiple full configs: falls back to proxy-provider mode.
+/// - Mixed / multiple full configs: returns an explicit error.
 ///
 /// Returns `(path, strategy_description)`.
 pub async fn smart_write_config_yaml(
@@ -457,42 +562,99 @@ pub async fn smart_write_config_yaml(
         bail!("No subscriptions provided");
     }
 
-    // Fetch all subscription texts and detect formats
-    let mut fetched: Vec<(&Subscription, String, SubscriptionFormat)> = Vec::new();
-    for s in subs {
-        let text = fetch_subscription(&s.url).await
-            .with_context(|| format!("Failed to fetch subscription: {}", s.name))?;
-        let fmt = detect_subscription_format(&text);
-        info!("Subscription '{}' detected as: {:?}", s.name, fmt);
-        fetched.push((s, text, fmt));
+    let fetched = inspect_subscriptions(subs).await?;
+    let full_count = fetched
+        .iter()
+        .filter(|sub| sub.format == SubscriptionFormat::FullConfig)
+        .count();
+
+    if full_count == 0 {
+        let config_path = write_config_yaml(cfg, subs)?;
+        return Ok((config_path, "proxy-provider".to_string()));
     }
 
-    let all_full = fetched.iter().all(|(_, _, f)| *f == SubscriptionFormat::FullConfig);
-    let all_provider = fetched.iter().all(|(_, _, f)| *f == SubscriptionFormat::ProxyProvider);
-
-    let path = config_dir()?.join("mihomo-config.yaml");
-
-    if all_full && fetched.len() == 1 {
-        // Single full config: merge port/controller directly
-        let (s, text, _) = &fetched[0];
-        let yaml = merge_full_config(text, cfg)
-            .with_context(|| format!("Failed to merge full config for '{}'", s.name))?;
-        std::fs::write(&path, &yaml)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
-        info!("Smart config: using full config from '{}'", s.name);
-        Ok((path, format!("full-config ({})", s.name)))
-    } else if all_provider {
-        // All are proxy-provider format: use standard generation
-        let config_path = write_config_yaml(cfg, subs)?;
-        Ok((config_path, "proxy-provider".to_string()))
-    } else {
-        // Mixed or multiple full configs: fall back to proxy-provider
-        warn!(
-            "Mixed subscription formats detected, falling back to proxy-provider mode."
+    if fetched.len() != 1 {
+        bail!(
+            "Cannot combine full-config subscriptions with other subscriptions. Please start them individually."
         );
-        let config_path = write_config_yaml(cfg, subs)?;
-        Ok((config_path, "proxy-provider (mixed fallback)".to_string()))
     }
+
+    let fetched_sub = &fetched[0];
+    let path = config_dir()?.join("mihomo-config.yaml");
+    let yaml = merge_full_config(&fetched_sub.text, cfg)
+        .with_context(|| format!("Failed to merge full config for '{}'", fetched_sub.sub.name))?;
+    std::fs::write(&path, &yaml)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    info!("Smart config: using full config from '{}'", fetched_sub.sub.name);
+    Ok((path, format!("full-config ({})", fetched_sub.sub.name)))
+}
+
+pub async fn update_running_subscriptions(
+    cfg: &LadderConfig,
+    subs: &[&Subscription],
+) -> Result<Vec<SubscriptionUpdateReport>> {
+    if subs.is_empty() {
+        bail!("No subscriptions provided");
+    }
+
+    let fetched = inspect_subscriptions(subs).await?;
+    let full_count = fetched
+        .iter()
+        .filter(|sub| sub.format == SubscriptionFormat::FullConfig)
+        .count();
+
+    if full_count > 0 {
+        if fetched.len() != 1 {
+            bail!(
+                "Cannot update full-config subscriptions together with other subscriptions. Please update them one at a time."
+            );
+        }
+
+        let fetched_sub = &fetched[0];
+        let yaml = merge_full_config(&fetched_sub.text, cfg)
+            .with_context(|| format!("Failed to merge full config for '{}'", fetched_sub.sub.name))?;
+        let config_path = config_dir()?.join("mihomo-config.yaml");
+        std::fs::write(&config_path, &yaml)
+            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+
+        let mihomo_api = MihomoApi::new(
+            cfg.ladder.control_port,
+            cfg.ladder.api_secret.as_deref(),
+        )?;
+        let detail = match mihomo_api.reload_config(&config_path).await {
+            Ok(_) => "full-config, reloaded".to_string(),
+            Err(e) => format!("full-config, written — restart to apply ({})", e),
+        };
+
+        return Ok(vec![SubscriptionUpdateReport {
+            name: fetched_sub.sub.name.clone(),
+            success: true,
+            detail,
+        }]);
+    }
+
+    let mihomo_api = MihomoApi::new(
+        cfg.ladder.control_port,
+        cfg.ladder.api_secret.as_deref(),
+    )?;
+    let mut reports = Vec::new();
+
+    for fetched_sub in fetched {
+        match mihomo_api.update_provider(&fetched_sub.sub.name).await {
+            Ok(_) => reports.push(SubscriptionUpdateReport {
+                name: fetched_sub.sub.name.clone(),
+                success: true,
+                detail: "proxy-provider".to_string(),
+            }),
+            Err(e) => reports.push(SubscriptionUpdateReport {
+                name: fetched_sub.sub.name.clone(),
+                success: false,
+                detail: e.to_string(),
+            }),
+        }
+    }
+
+    Ok(reports)
 }
 
 // ─── Process management ───────────────────────────────────────────────────────
@@ -652,8 +814,32 @@ proxies:
     }
 
     #[test]
+    fn test_detect_full_config_without_top_level_proxies() {
+        let yaml = r#"
+proxy-providers:
+  westworld:
+    type: http
+    url: https://files.ddddavid.cn/private/WestWorld.yaml
+    interval: 86400
+proxy-groups:
+  - name: PROXY
+    type: select
+    use: [westworld]
+rules:
+  - MATCH,PROXY
+"#;
+        assert_eq!(detect_subscription_format(yaml), SubscriptionFormat::FullConfig);
+    }
+
+    #[test]
     fn test_detect_invalid_yaml() {
-        assert_eq!(detect_subscription_format("not: valid: yaml: ["), SubscriptionFormat::ProxyProvider);
+        assert_eq!(detect_subscription_format("not: valid: yaml: ["), SubscriptionFormat::Unknown);
+    }
+
+    #[test]
+    fn test_detect_html_response_as_unknown() {
+        let html = "<html><body>403 Forbidden</body></html>";
+        assert_eq!(detect_subscription_format(html), SubscriptionFormat::Unknown);
     }
 
     #[test]

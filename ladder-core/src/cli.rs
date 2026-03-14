@@ -66,6 +66,18 @@ pub enum Commands {
         action: SubCommands,
     },
 
+    /// Add a subscription (alias of `sub add`)
+    Add {
+        /// Subscription URL
+        url: String,
+        /// Display name
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Update interval in seconds (default: 86400)
+        #[arg(short, long, default_value = "86400")]
+        interval: u64,
+    },
+
     /// Force update all (or specified) subscription providers
     Update {
         /// Subscription name to update (default: all)
