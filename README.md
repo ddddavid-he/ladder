@@ -48,10 +48,10 @@ mv ladder-core ~/.local/bin/
 
 ### 2. 安装 Shell 集成
 
-`env.sh` 由二进制在安装时自动生成，所以不需要单独下载脚本文件。
+`install` 会把当前二进制复制到 `~/.local/ladder/ladder-core`，并生成 `~/.config/ladder/env.sh`，所以不需要单独下载脚本文件。
 
 ```sh
-# 写入 ~/.config/ladder/env.sh，并输出你需要添加到 shell rc 的命令
+# 安装受管的 ladder-core 到 ~/.local/ladder/，并写入 ~/.config/ladder/env.sh
 ladder-core install
 
 # 然后手动加入到 shell 配置文件
@@ -162,11 +162,11 @@ interval = 43200
 
 `env.sh` 会提供一个 `ladder` Shell 函数，适用于 `bash`、`zsh`、`dash` 等 POSIX 风格 Shell。
 
-当你使用带 `--env` 的命令时，这个函数会执行 `eval "$(ladder-core ...)"`，从而把 `ladder-core` 输出的环境变量语句直接作用到当前 Shell。
+当你使用带 `--env` 的命令时，这个函数会优先调用 `~/.local/ladder/ladder-core`（其次才是脚本同目录、`PATH` 和兼容旧路径），再把它输出的环境变量语句直接作用到当前 Shell。
 
 ```sh
 # ladder start --env 的内部行为
-eval "$(ladder-core start --env --shell-pid $$)"
+eval "$(~/.local/ladder/ladder-core start --env --shell-pid $$)"
 # 会设置：HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, http_proxy, https_proxy, all_proxy, NO_PROXY, no_proxy
 ```
 

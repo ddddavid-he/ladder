@@ -7,7 +7,13 @@
 # ─── Locate ladder-core binary ───────────────────────────────────────────────
 
 _ladder_core_bin() {
-    # 1. Same directory as this script
+    # 1. Managed install location
+    if [ -x "$HOME/.local/ladder/ladder-core" ]; then
+        echo "$HOME/.local/ladder/ladder-core"
+        return 0
+    fi
+
+    # 2. Same directory as this script (useful for dev / portable layouts)
     if [ -n "${BASH_SOURCE[0]}" ]; then
         _ld_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
     elif [ -n "${0}" ] && [ "${0}" != "sh" ] && [ "${0}" != "bash" ] && [ "${0}" != "zsh" ]; then
@@ -21,19 +27,19 @@ _ladder_core_bin() {
         return 0
     fi
 
-    # 2. PATH
+    # 3. PATH
     if command -v ladder-core >/dev/null 2>&1; then
         echo "ladder-core"
         return 0
     fi
 
-    # 3. ~/.config/ladder/
+    # 4. Legacy install location
     if [ -x "$HOME/.config/ladder/ladder-core" ]; then
         echo "$HOME/.config/ladder/ladder-core"
         return 0
     fi
 
-    echo "Error: ladder-core not found. Please install it to PATH or ~/.config/ladder/" >&2
+    echo "Error: ladder-core not found. Expected $HOME/.local/ladder/ladder-core, PATH, or legacy ~/.config/ladder/ladder-core" >&2
     return 1
 }
 
