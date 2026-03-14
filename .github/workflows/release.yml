@@ -92,6 +92,7 @@ jobs:
   build-macos:
     name: Build macOS (${{ matrix.arch }})
     runs-on: macos-latest
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -150,23 +151,11 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
-
-      - name: Flatten artifacts
-        run: |
-          find dist/ -type f | while read f; do
-            mv "$f" dist/$(basename "$f")
-          done
-          # Remove empty subdirs
-          find dist/ -type d -empty -delete
-
-      - name: Copy ladder.sh
-        run: cp ladder-core/ladder.sh dist/ladder.sh
+          merge-multiple: true
 
       - name: Generate checksums
         working-directory: dist
@@ -177,7 +166,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "Ladder v${{ github.ref_name }}"
+          name: "Ladder ${{ github.ref_name }}"
           draft: false
           prerelease: false
           generate_release_notes: true
@@ -190,5 +179,4 @@ jobs:
             dist/ladder-core-bundled-linux-arm64
             dist/ladder-core-bundled-macos-amd64
             dist/ladder-core-bundled-macos-arm64
-            dist/ladder.sh
             dist/checksums.txt

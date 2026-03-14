@@ -294,22 +294,11 @@ async fn main() -> Result<()> {
             }
             println!("✓ Installed ladder-core  →  {}", dest_bin.display());
 
-            // ── Step 2: Install ladder.sh ────────────────────────────────────
+            // ── Step 2: Install env.sh ───────────────────────────────────────
             let config = config::config_dir()?;
-            let dest_sh = config.join("ladder.sh");
-
-            // Try same directory as current exe first, then fall back to embedded
-            let ladder_sh_src = current_exe
-                .parent()
-                .map(|p| p.join("ladder.sh"))
-                .filter(|p| p.exists());
-
-            if let Some(src) = ladder_sh_src {
-                std::fs::copy(&src, &dest_sh)?;
-            } else {
-                let sh_content = include_str!("../ladder.sh");
-                std::fs::write(&dest_sh, sh_content)?;
-            }
+            let dest_sh = config.join("env.sh");
+            let sh_content = include_str!("../env.sh");
+            std::fs::write(&dest_sh, sh_content)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -317,7 +306,7 @@ async fn main() -> Result<()> {
                 perms.set_mode(0o644);
                 std::fs::set_permissions(&dest_sh, perms)?;
             }
-            println!("✓ Installed ladder.sh    →  {}", dest_sh.display());
+            println!("✓ Installed env.sh       →  {}", dest_sh.display());
 
             // ── Step 3: Print shell rc config (do NOT auto-inject) ───────────
             let shell_name = shell.unwrap_or_else(|| {

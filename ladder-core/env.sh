@@ -1,8 +1,8 @@
 #!/bin/sh
-# ladder.sh - Shell wrapper for ladder-core
-# Usage: source ladder.sh
+# env.sh - Shell wrapper for ladder-core
+# Usage: source env.sh
 # Supports: bash, zsh, dash (POSIX sh)
-# fish users: use `bass source ladder.sh` or configure manually
+# fish users: use `bass source env.sh` or configure manually
 
 # ─── Locate ladder-core binary ───────────────────────────────────────────────
 

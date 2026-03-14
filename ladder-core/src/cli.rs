@@ -24,11 +24,11 @@ pub enum Commands {
         #[arg(short = 's', long = "sub", value_name = "NAME")]
         subscriptions: Vec<String>,
 
-        /// Output shell export statements to stdout (for eval by ladder.sh)
+        /// Output shell export statements to stdout (for eval by env.sh)
         #[arg(long)]
         env: bool,
 
-        /// Shell PID to monitor (passed by ladder.sh, triggers watchdog)
+        /// Shell PID to monitor (passed by env.sh, triggers watchdog)
         #[arg(long, value_name = "PID")]
         shell_pid: Option<u32>,
 
@@ -43,7 +43,7 @@ pub enum Commands {
 
     /// Stop the running proxy
     Stop {
-        /// Also output unset statements to stdout (for eval by ladder.sh)
+        /// Also output unset statements to stdout (for eval by env.sh)
         #[arg(long)]
         env: bool,
     },
@@ -85,7 +85,7 @@ pub enum Commands {
         subscriptions: Vec<String>,
     },
 
-    /// Install: write ladder.sh to ~/.config/ladder/ and inject into shell rc
+    /// Install: write env.sh to ~/.config/ladder/ and print shell rc instructions
     Install {
         /// Shell type: bash, zsh, fish (auto-detect if not specified)
         #[arg(long, value_name = "SHELL")]
