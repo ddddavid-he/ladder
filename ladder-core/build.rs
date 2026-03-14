@@ -4,8 +4,8 @@
 ///   1. Detect target OS + arch from CARGO_CFG_TARGET_OS / CARGO_CFG_TARGET_ARCH
 ///   2. Fetch latest mihomo release tag from GitHub API
 ///   3. Download matching mihomo release .gz from GitHub
-///   4. Decompress and write to OUT_DIR/mihomo
-///   5. src/mihomo.rs uses `include_bytes!(concat!(env!("OUT_DIR"), "/mihomo"))`
+///   4. Save the raw .gz bytes to OUT_DIR/mihomo (kept compressed!)
+///   5. src/mihomo.rs uses `include_bytes!` to embed, then `extract_bundled()` decompresses at runtime
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -56,25 +56,26 @@ fn download_mihomo_for_target() -> anyhow::Result<()> {
         .bytes()
         .map_err(|e| anyhow::anyhow!("Read body failed: {}", e))?;
 
-    let mut gz = GzDecoder::new(gz_bytes.as_ref());
-    let mut buf = Vec::new();
-    gz.read_to_end(&mut buf)
-        .map_err(|e| anyhow::anyhow!("Decompress failed: {}", e))?;
-
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
-    let dest = std::path::Path::new(&out_dir).join("mihomo");
-    std::fs::write(&dest, &buf)?;
-
-    // Set executable bit
-    #[cfg(unix)]
+    // Validate the gzip data is well-formed at build time (catch corruption early),
+    // but do NOT save the decompressed output — we embed the .gz to keep binary small.
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms)?;
+        let mut gz = GzDecoder::new(gz_bytes.as_ref());
+        let mut buf = Vec::new();
+        gz.read_to_end(&mut buf)
+            .map_err(|e| anyhow::anyhow!("Gzip validation failed (corrupt download?): {}", e))?;
+        println!(
+            "cargo:warning=Mihomo binary: compressed={} bytes, decompressed={} bytes",
+            gz_bytes.len(),
+            buf.len()
+        );
     }
 
-    println!("cargo:warning=Mihomo binary written to {:?}", dest);
+    // Write the raw .gz bytes — runtime extract_bundled() will decompress via GzDecoder.
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+    let dest = std::path::Path::new(&out_dir).join("mihomo");
+    std::fs::write(&dest, &gz_bytes)?;
+
+    println!("cargo:warning=Mihomo .gz written to {:?}", dest);
     Ok(())
 }
 
