@@ -61,7 +61,10 @@ async fn run_event_loop(
         // Draw frame
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Auto-refresh node list
+        // Process any pending background task messages (non-blocking)
+        app.process_bg_messages().await;
+
+        // Auto-refresh node list (only when idle)
         if app.last_refresh.elapsed() >= refresh_interval && app.mode == app::AppMode::Normal {
             app.refresh_nodes().await;
         }
@@ -81,6 +84,8 @@ async fn run_event_loop(
         }
 
         if app.should_quit {
+            // Cancel any running background task before quitting
+            app.cancel_current();
             break;
         }
     }
@@ -88,8 +93,25 @@ async fn run_event_loop(
 }
 
 async fn handle_key(app: &mut app::App, key: KeyCode) {
-    // Ignore keys during async operations
+    // During background operations: only allow cancel (Esc/q) and navigation
     if app.mode != app::AppMode::Normal {
+        match key {
+            KeyCode::Esc => {
+                app.cancel_current();
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                app.cancel_current();
+                app.should_quit = true;
+            }
+            // Allow navigation during background ops
+            KeyCode::Up | KeyCode::Char('k') => app.cursor_up(),
+            KeyCode::Down | KeyCode::Char('j') => app.cursor_down(),
+            KeyCode::Tab => app.next_tab(),
+            KeyCode::BackTab => app.prev_tab(),
+            KeyCode::Left | KeyCode::Char('h') => app.prev_tab(),
+            KeyCode::Right | KeyCode::Char('l') => app.next_tab(),
+            _ => {}
+        }
         return;
     }
 
@@ -112,14 +134,14 @@ async fn handle_key(app: &mut app::App, key: KeyCode) {
         // Select node
         KeyCode::Enter => app.select_current().await,
 
-        // Speed test
-        KeyCode::Char('t') | KeyCode::Char('T') => app.run_speed_test().await,
+        // Speed test (non-blocking)
+        KeyCode::Char('t') | KeyCode::Char('T') => app.run_speed_test(),
 
-        // Auto-best
-        KeyCode::Char('a') | KeyCode::Char('A') => app.auto_best().await,
+        // Auto-best (non-blocking)
+        KeyCode::Char('a') | KeyCode::Char('A') => app.auto_best(),
 
-        // Update providers
-        KeyCode::Char('u') | KeyCode::Char('U') => app.update_providers().await,
+        // Update providers (non-blocking)
+        KeyCode::Char('u') | KeyCode::Char('U') => app.update_providers(),
 
         // Manual refresh
         KeyCode::Char('r') | KeyCode::Char('R') => app.refresh_nodes().await,

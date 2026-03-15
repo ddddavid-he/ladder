@@ -17,6 +17,7 @@ bundled = []  # embed mihomo binary at compile time via build.rs
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 # HTTP client (rustls avoids OpenSSL dependency, required for musl static builds)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

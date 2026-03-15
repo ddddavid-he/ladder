@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::{MihomoApi, ProxyInfo};
 use crate::config::LadderConfig;
@@ -13,6 +15,21 @@ pub enum AppMode {
     Normal,
     Testing,    // speed test in progress
     AutoBest,   // auto-best selection in progress
+    Updating,   // subscription update in progress
+}
+
+/// Messages sent from background tasks back to the event loop
+pub enum BgMessage {
+    /// A single node delay result (name, delay)
+    DelayResult(String, u64),
+    /// Speed test finished
+    SpeedTestDone,
+    /// Auto-best finished: selected node name and delay
+    AutoBestDone(Result<(String, u64)>),
+    /// Subscription update finished
+    UpdateDone(Result<Vec<crate::mihomo::SubscriptionUpdateReport>>),
+    /// Status message update
+    Status(String),
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +83,16 @@ pub struct App {
 
     /// Last refresh time
     pub last_refresh: Instant,
+
+    /// Channel receiver for background task messages
+    pub bg_rx: mpsc::UnboundedReceiver<BgMessage>,
+    /// Channel sender (cloned into background tasks)
+    pub bg_tx: mpsc::UnboundedSender<BgMessage>,
+    /// Cancellation token for the current background operation
+    pub cancel_token: Option<CancellationToken>,
+
+    /// Progress counter for speed test (completed / total)
+    pub test_progress: Option<(usize, usize)>,
 }
 
 impl App {
@@ -85,6 +112,8 @@ impl App {
             tabs.push(TabFilter::Sub(sub.name.clone()));
         }
 
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             cfg,
             state,
@@ -99,6 +128,10 @@ impl App {
             status_msg_time: None,
             should_quit: false,
             last_refresh: Instant::now() - Duration::from_secs(60), // trigger immediate refresh
+            bg_rx,
+            bg_tx,
+            cancel_token: None,
+            test_progress: None,
         })
     }
 
@@ -231,8 +264,8 @@ impl App {
         }
     }
 
-    /// Run speed test on all visible nodes
-    pub async fn run_speed_test(&mut self) {
+    /// Run speed test on all visible nodes (non-blocking: spawns a background task)
+    pub fn run_speed_test(&mut self) {
         let api = match &self.api {
             Some(_) => MihomoApi::new(
                 self.state.control_port,
@@ -243,31 +276,40 @@ impl App {
         let Some(api) = api else { return };
 
         self.mode = AppMode::Testing;
-        self.set_status("测速中...".to_string());
-
         let node_names: Vec<String> = self.nodes.iter().map(|n| n.name.clone()).collect();
-        let mut delays = HashMap::new();
+        let total = node_names.len();
+        self.test_progress = Some((0, total));
+        self.set_status(format!("测速中... (0/{})", total));
 
-        for name in &node_names {
-            let d = api
-                .get_delay(name, "https://www.gstatic.com/generate_204")
-                .await
-                .unwrap_or(0);
-            delays.insert(name.clone(), d);
-        }
+        let tx = self.bg_tx.clone();
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
 
-        for node in &mut self.nodes {
-            if let Some(d) = delays.get(&node.name) {
-                node.delay = *d;
+        tokio::spawn(async move {
+            for (i, name) in node_names.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    let _ = tx.send(BgMessage::Status("⚠ 测速已取消".to_string()));
+                    let _ = tx.send(BgMessage::SpeedTestDone);
+                    return;
+                }
+                let d = api
+                    .get_delay(name, "https://www.gstatic.com/generate_204")
+                    .await
+                    .unwrap_or(0);
+                let _ = tx.send(BgMessage::DelayResult(name.clone(), d));
+                let _ = tx.send(BgMessage::Status(format!(
+                    "测速中... ({}/{})",
+                    i + 1,
+                    node_names.len()
+                )));
             }
-        }
-
-        self.mode = AppMode::Normal;
-        self.set_status("✓ 测速完成".to_string());
+            let _ = tx.send(BgMessage::Status("✓ 测速完成".to_string()));
+            let _ = tx.send(BgMessage::SpeedTestDone);
+        });
     }
 
-    /// Auto-select best node
-    pub async fn auto_best(&mut self) {
+    /// Auto-select best node (non-blocking: spawns a background task)
+    pub fn auto_best(&mut self) {
         let api = match &self.api {
             Some(_) => MihomoApi::new(
                 self.state.control_port,
@@ -280,50 +322,87 @@ impl App {
         self.mode = AppMode::AutoBest;
         self.set_status("🔍 自动选优中...".to_string());
 
-        let group_name = self.detect_main_group().await.unwrap_or_else(|| "PROXY".to_string());
+        let tx = self.bg_tx.clone();
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
 
-        match api
-            .auto_best(&group_name, "https://www.gstatic.com/generate_204")
-            .await
-        {
-            Ok((node, delay)) => {
-                self.current_node = Some(node.clone());
-                for n in &mut self.nodes {
-                    n.is_current = n.name == node;
+        // We need the group name. Detect it first, then spawn the task.
+        let control_port = self.state.control_port;
+        let api_secret = self.cfg.ladder.api_secret.clone();
+
+        tokio::spawn(async move {
+            // Detect main group
+            let group_name = {
+                let detect_api = match MihomoApi::new(control_port, api_secret.as_deref()) {
+                    Ok(a) => a,
+                    Err(_) => {
+                        let _ = tx.send(BgMessage::AutoBestDone(Err(anyhow::anyhow!(
+                            "无法创建 API 客户端"
+                        ))));
+                        return;
+                    }
+                };
+                let proxies = match detect_api.get_proxies().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(BgMessage::AutoBestDone(Err(e)));
+                        return;
+                    }
+                };
+                let mut found = None;
+                for name in &["PROXY", "🔰 节点选择", "节点选择", "Proxy"] {
+                    if proxies.contains_key(*name) {
+                        found = Some(name.to_string());
+                        break;
+                    }
                 }
-                self.set_status(format!("✓ 已切换到最优节点 {} ({}ms)", node, delay));
-            }
-            Err(e) => {
-                self.set_status(format!("自动选优失败: {}", e));
-            }
-        }
+                found.or_else(|| {
+                    proxies.iter()
+                        .find(|(_, info)| {
+                            info.proxy_type.eq_ignore_ascii_case("Selector")
+                                && info.all.is_some()
+                        })
+                        .map(|(name, _)| name.clone())
+                }).unwrap_or_else(|| "PROXY".to_string())
+            };
 
-        self.mode = AppMode::Normal;
+            if cancel.is_cancelled() {
+                let _ = tx.send(BgMessage::Status("⚠ 自动选优已取消".to_string()));
+                let _ = tx.send(BgMessage::AutoBestDone(Err(anyhow::anyhow!("cancelled"))));
+                return;
+            }
+
+            let result = api
+                .auto_best(&group_name, "https://www.gstatic.com/generate_204")
+                .await;
+            let _ = tx.send(BgMessage::AutoBestDone(result));
+        });
     }
 
-    /// Force-update all subscriptions
-    pub async fn update_providers(&mut self) {
+    /// Force-update all subscriptions (non-blocking: spawns a background task)
+    pub fn update_providers(&mut self) {
         if self.api.is_none() {
             return;
         }
 
+        self.mode = AppMode::Updating;
         self.set_status("更新订阅中...".to_string());
 
-        let subs: Vec<_> = self.cfg.subscriptions.iter().collect();
-        match crate::mihomo::update_running_subscriptions(&self.cfg, &subs).await {
-            Ok(reports) => {
-                let failed = reports.iter().filter(|report| !report.success).count();
-                if failed == 0 {
-                    self.set_status(format!("✓ 已更新 {} 个订阅", reports.len()));
-                } else {
-                    self.set_status(format!("更新完成，{} 个成功，{} 个失败", reports.len() - failed, failed));
-                }
-                self.refresh_nodes().await;
+        let tx = self.bg_tx.clone();
+        let cfg = self.cfg.clone();
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
+
+        tokio::spawn(async move {
+            let subs: Vec<_> = cfg.subscriptions.iter().collect();
+            let result = crate::mihomo::update_running_subscriptions(&cfg, &subs).await;
+            if !cancel.is_cancelled() {
+                let _ = tx.send(BgMessage::UpdateDone(result));
+            } else {
+                let _ = tx.send(BgMessage::Status("⚠ 更新已取消".to_string()));
+                let _ = tx.send(BgMessage::UpdateDone(Err(anyhow::anyhow!("cancelled"))));
             }
-            Err(e) => {
-                self.set_status(format!("更新失败: {}", e));
-            }
-        }
+        });
     }
 
     pub fn set_status(&mut self, msg: String) {
@@ -334,9 +413,107 @@ impl App {
     /// Clear status message after 3 seconds
     pub fn tick_status(&mut self) {
         if let Some(t) = self.status_msg_time {
-            if t.elapsed() > Duration::from_secs(3) {
+            if t.elapsed() > Duration::from_secs(3) && self.mode == AppMode::Normal {
                 self.status_msg = None;
                 self.status_msg_time = None;
+            }
+        }
+    }
+
+    /// Cancel the current background operation (if any)
+    pub fn cancel_current(&mut self) {
+        if let Some(token) = self.cancel_token.take() {
+            token.cancel();
+        }
+        self.mode = AppMode::Normal;
+        self.test_progress = None;
+        self.set_status("⚠ 操作已取消".to_string());
+    }
+
+    /// Process all pending messages from background tasks (non-blocking).
+    /// Should be called every tick in the event loop.
+    pub async fn process_bg_messages(&mut self) {
+        // Drain all available messages without blocking
+        loop {
+            match self.bg_rx.try_recv() {
+                Ok(msg) => match msg {
+                    BgMessage::DelayResult(name, delay) => {
+                        for node in &mut self.nodes {
+                            if node.name == name {
+                                node.delay = delay;
+                            }
+                        }
+                        // Update progress counter
+                        if let Some((ref mut done, total)) = self.test_progress {
+                            *done += 1;
+                            if *done >= total {
+                                self.test_progress = None;
+                            }
+                        }
+                    }
+                    BgMessage::SpeedTestDone => {
+                        self.mode = AppMode::Normal;
+                        self.cancel_token = None;
+                        self.test_progress = None;
+                    }
+                    BgMessage::AutoBestDone(result) => {
+                        match result {
+                            Ok((node, delay)) => {
+                                self.current_node = Some(node.clone());
+                                for n in &mut self.nodes {
+                                    n.is_current = n.name == node;
+                                }
+                                self.set_status(format!(
+                                    "✓ 已切换到最优节点 {} ({}ms)",
+                                    node, delay
+                                ));
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg != "cancelled" {
+                                    self.set_status(format!("自动选优失败: {}", msg));
+                                }
+                            }
+                        }
+                        self.mode = AppMode::Normal;
+                        self.cancel_token = None;
+                    }
+                    BgMessage::UpdateDone(result) => {
+                        match result {
+                            Ok(reports) => {
+                                let failed =
+                                    reports.iter().filter(|report| !report.success).count();
+                                if failed == 0 {
+                                    self.set_status(format!(
+                                        "✓ 已更新 {} 个订阅",
+                                        reports.len()
+                                    ));
+                                } else {
+                                    self.set_status(format!(
+                                        "更新完成，{} 个成功，{} 个失败",
+                                        reports.len() - failed,
+                                        failed
+                                    ));
+                                }
+                                // Trigger a refresh after update
+                                self.refresh_nodes().await;
+                            }
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg != "cancelled" {
+                                    self.set_status(format!("更新失败: {}", msg));
+                                }
+                            }
+                        }
+                        self.mode = AppMode::Normal;
+                        self.cancel_token = None;
+                    }
+                    BgMessage::Status(msg) => {
+                        self.set_status(msg);
+                    }
+                },
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
     }

@@ -39,9 +39,16 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mode_indicator = match app.mode {
-        AppMode::Testing => "  [测速中...]",
-        AppMode::AutoBest => "  [自动选优...]",
-        AppMode::Normal => "",
+        AppMode::Testing => {
+            if let Some((done, total)) = app.test_progress {
+                format!("  [测速中 {}/{}]", done, total)
+            } else {
+                "  [测速中...]".to_string()
+            }
+        }
+        AppMode::AutoBest => "  [自动选优...]".to_string(),
+        AppMode::Updating => "  [更新订阅...]".to_string(),
+        AppMode::Normal => String::new(),
     };
 
     let title_line = Line::from(vec![
@@ -192,21 +199,33 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(status_line, chunks[0]);
 
     // Right: key hints
-    let keys = Line::from(vec![
-        key_hint("↑↓", "移动"),
-        Span::raw(" "),
-        key_hint("Enter", "切换"),
-        Span::raw(" "),
-        key_hint("Tab", "分组"),
-        Span::raw(" "),
-        key_hint("T", "测速"),
-        Span::raw(" "),
-        key_hint("A", "自动最优"),
-        Span::raw(" "),
-        key_hint("U", "更新订阅"),
-        Span::raw(" "),
-        key_hint("Q", "退出"),
-    ]);
+    let keys = if app.mode != AppMode::Normal {
+        Line::from(vec![
+            key_hint("↑↓", "移动"),
+            Span::raw(" "),
+            key_hint("Tab", "分组"),
+            Span::raw("  "),
+            key_hint("Esc", "取消"),
+            Span::raw(" "),
+            key_hint("Q", "退出"),
+        ])
+    } else {
+        Line::from(vec![
+            key_hint("↑↓", "移动"),
+            Span::raw(" "),
+            key_hint("Enter", "切换"),
+            Span::raw(" "),
+            key_hint("Tab", "分组"),
+            Span::raw(" "),
+            key_hint("T", "测速"),
+            Span::raw(" "),
+            key_hint("A", "自动最优"),
+            Span::raw(" "),
+            key_hint("U", "更新订阅"),
+            Span::raw(" "),
+            key_hint("Q", "退出"),
+        ])
+    };
     let keys_para = Paragraph::new(keys)
         .block(Block::default().borders(Borders::ALL))
         .alignment(Alignment::Center);
